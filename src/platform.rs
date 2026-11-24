@@ -53,6 +53,9 @@ pub enum DriverError {
     Busy,
     Timeout,
     InvalidState,
+    NotReady,       // драйвер не инициализирован
+    InvalidArg,     // неверный аргумент
+    IoError,        // ошибка ввода-вывода
 }
 
 impl fmt::Display for DriverError {
