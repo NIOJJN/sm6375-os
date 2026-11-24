@@ -243,6 +243,9 @@ fn ufs_probe(dev: &PlatformDevice) -> Result<(), DriverError> {
         crate::drivers::gcc_sm6375::clk_enable_by_id(clk_id as u32)?;
     }
     
+    // Проверяем и включаем все критические такты через clock_verify
+    crate::drivers::clock_verify::verify_clock_tree()?;
+    
     // Инициализация PHY
     crate::drivers::vibro::indicate(crate::drivers::vibro::BootStage::UfsInit);
     ufs_phy_init()?;

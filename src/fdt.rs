@@ -61,6 +61,8 @@ pub struct BootInfo {
     pub geni_uart: Option<usize>,
     /// APSS watchdog (compatible "qcom,msm-watchdog") — база для отключения.
     pub wdt: Option<usize>,
+    /// TLMM pinctrl база (pinctrl@400000) для настройки пинов UART и др.
+    pub pinctrl: Option<usize>,
 }
 
 struct Node<'a> {
@@ -76,6 +78,7 @@ struct Node<'a> {
     is_chosen: bool,
     is_geni_uart: bool,
     is_watchdog: bool,
+    is_pinctrl: bool,
     /// Родитель — /reserved-memory
     is_reserved: bool,
     /// status == "disabled" — узел не трогаем.
@@ -101,6 +104,7 @@ impl<'a> Node<'a> {
             is_chosen: false,
             is_geni_uart: false,
             is_watchdog: false,
+            is_pinctrl: false,
             is_reserved: false,
             disabled: false,
             enable_psci: false,
@@ -219,6 +223,9 @@ fn finalize(info: &mut BootInfo, n: &Node, (ac, sc): (usize, usize)) {
     if n.is_geni_uart && info.geni_uart.is_none() && !n.disabled {
         info.geni_uart = Some(base as usize);
     }
+    if n.is_pinctrl && info.pinctrl.is_none() && !n.disabled {
+        info.pinctrl = Some(base as usize);
+    }
     if n.is_watchdog && info.wdt.is_none() && !n.disabled {
         info.wdt = Some(base as usize);
     }
@@ -286,6 +293,7 @@ pub fn parse(dtb: usize) -> Option<BootInfo> {
         initrd_end: None,
         geni_uart: None,
         wdt: None,
+        pinctrl: None,
     };
     let mut cells = [(2usize, 1usize); MAX_DEPTH + 1];
     let mut depth = 0usize;
@@ -382,6 +390,7 @@ pub fn parse(dtb: usize) -> Option<BootInfo> {
                         node.is_virtio_mmio |= has_compat(data, b"virtio,mmio");
                         node.is_geni_uart |= has_compat(data, b"qcom,msm-geni-console");
                         node.is_watchdog |= has_compat(data, b"qcom,msm-watchdog");
+                        node.is_pinctrl |= has_compat(data, b"qcom,tlmm");
                     }
                     b"linux,initrd-start" if node.is_chosen && len >= 4 => {
                         info.initrd_start = Some(read_u64_prop(data) as usize);

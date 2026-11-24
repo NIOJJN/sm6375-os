@@ -207,6 +207,9 @@ fn gcc_probe(dev: &PlatformDevice) -> Result<(), DriverError> {
     // Маппим GCC в виртуальную память (identity mapping уже есть в PMM)
     *GCC_MAPPED.lock() = Some(base);
 
+    // Запоминаем базу для clock_verify
+    crate::drivers::clock_verify::clock_set_gcc_base(base);
+
     kprintln!("gcc-sm6375: mapped at {:#x}, size={:#x}", base, size);
 
     // Базовая проверка: читаем какой-нибудь регистр

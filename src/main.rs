@@ -228,8 +228,17 @@ pub extern "C" fn kernel_main(dtb: usize) -> ! {
     // ---- Platform device model (Qualcomm SM6375) ----
     // Парсинг DT и регистрация platform устройств
     platform::platform_init(info.dtb);
-    // Пробирование драйверов: GCC -> SPMI -> PMIC -> UART
+    // Пробирование драйверов: GCC -> SPMI -> PMIC -> UART -> UFS
     platform::platform_drivers_init();
+
+    // Инициализация pinmux (TLMM) для UART пинов, если загрузчик не настроил
+    if let Some(tlmm_base) = info.pinctrl {
+        crate::drivers::pinmux::tlmm_init(tlmm_base);
+        let _ = crate::drivers::pinmux::tlmm_setup_console_uart();
+    }
+
+    // Дамп статуса тактов для отладки
+    crate::drivers::clock_verify::dump_clock_status();
 
     // ---- GICv3 ----
     let Some(g) = info.gic else {
