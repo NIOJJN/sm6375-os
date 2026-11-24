@@ -324,6 +324,109 @@ struct ScsiRead10Cdb {
     control: u8,
 }
 
+/// Direction для SCSI команды
+#[derive(PartialEq)]
+enum ScsiDir {
+    None,
+    In,
+    Out,
+}
+
+/// Общий SCSI команда через UFS
+/// cdb: Command Descriptor Block (до 16 байт)
+/// dir: направление данных
+/// buf: буфер для данных (In/Out)
+/// expected_len: ожидаемая длина данных
+fn ufs_scsi_cmd_raw(cdb: &[u8], dir: ScsiDir, buf: &mut [u8], expected_len: usize) -> Result<usize, DriverError> {
+    if !UFS_INIT.load(Ordering::Acquire) {
+        return Err(DriverError::NotReady);
+    }
+    if cdb.len() > 16 {
+        return Err(DriverError::InvalidArg);
+    }
+    if (dir == ScsiDir::In || dir == ScsiDir::Out) && buf.len() < expected_len {
+        return Err(DriverError::InvalidArg);
+    }
+
+    let mut utrd = UFS_UTRD.lock();
+    let mut ucd = UFS_UCD.lock();
+    let mut read_buf = UFS_READ_BUF.lock();
+
+    // UTRD: указываем на UCD
+    let ucd_addr = &*ucd as *const Ucd as u64;
+    utrd.ucdba = ucd_addr;
+    utrd.ucdba_upper = 0;
+    utrd.response_upiu_offset = 32;
+    utrd.response_upiu_length = 32;
+    utrd.prdt_offset = 64;
+    utrd.prdt_length = if dir == ScsiDir::None { 0 } else { 1 };
+    utrd.overall_cmd_status = 0;
+
+    // PRDT для data-in/out
+    if dir != ScsiDir::None {
+        let buf_addr = read_buf.as_ptr() as u64;
+        ucd.prdt[0].base_addr = buf_addr;
+        ucd.prdt[0].data_byte_count = ((expected_len as u32) - 1) & 0x3FFFF;
+    }
+
+    // Command UPIU
+    ucd.cmd_upiu[0] = 0x01; // Transaction Type = Command
+    ucd.cmd_upiu[1] = 0x00; // Flags
+    ucd.cmd_upiu[2] = 0x00; // LUN
+    ucd.cmd_upiu[3] = 0x00; // Task Tag
+    ucd.cmd_upiu[4] = 0x00; // Command Set Type = SCSI
+    ucd.cmd_upiu[5] = 0x00; // Reserved
+    ucd.cmd_upiu[6] = 0x00; // Reserved
+    ucd.cmd_upiu[7] = 0x00; // Reserved
+    ucd.cmd_upiu[8] = 0x00; // EHS Length
+    ucd.cmd_upiu[9] = 0x00; // Reserved
+    // Data Segment Length (big-endian, 2 байта)
+    let data_len = expected_len as u16;
+    ucd.cmd_upiu[10] = (data_len >> 8) as u8;
+    ucd.cmd_upiu[11] = data_len as u8;
+    // CDB (bytes 12..)
+    let cdb_len = cdb.len().min(16);
+    ucd.cmd_upiu[12..12+cdb_len].copy_from_slice(&cdb[..cdb_len]);
+
+    // Настраиваем Transfer Request List
+    let utrd_addr = &*utrd as *const Utrd as u64;
+    ufs_write(reg::UTRLBA, (utrd_addr & 0xFFFFFFFF) as u32);
+    ufs_write(reg::UTRLBAU, (utrd_addr >> 32) as u32);
+
+    // Start Transfer Request List
+    ufs_write(reg::UTRLRSR, 1);
+
+    // Ring doorbell для slot 0
+    ufs_write(reg::UTRLDBR, 1 << 0);
+
+    // Ждём завершения (UTRCS bit в IS)
+    for _ in 0..10000 {
+        let is = ufs_read(reg::IS);
+        if (is & (1 << 0)) != 0 { // UTRCS bit
+            ufs_write(reg::IS, 1 << 0); // clear
+            
+            // Проверяем статус
+            if utrd.overall_cmd_status == 0 {
+                // Success: копируем данные для In
+                if dir == ScsiDir::In {
+                    buf[..expected_len].copy_from_slice(&read_buf[..expected_len]);
+                }
+                return Ok(expected_len);
+            } else {
+                return Err(DriverError::IoError);
+            }
+        }
+        udelay(10);
+    }
+
+    Err(DriverError::Timeout)
+}
+
+/// Обёртка для простых команд без данных (TEST UNIT READY, etc.)
+fn ufs_scsi_simple(opcode: u8) -> Result<(), DriverError> {
+    ufs_scsi_cmd_raw(&[opcode], ScsiDir::None, &mut [], 0).map(|_| ())
+}
+
 /// Buffer для чтения секторов (4KB aligned)
 static UFS_READ_BUF: SpinLock<[u8; 8192]> = SpinLock::new([0u8; 8192]);
 static UFS_UTRD: SpinLock<Utrd> = SpinLock::new(Utrd {
@@ -447,7 +550,21 @@ pub fn ufs_get_capacity() -> Result<u64, DriverError> {
         return Err(DriverError::NotReady);
     }
     
-    // TODO: отправить SCSI READ CAPACITY(10) команду
-    // Пока возвращаем фиксированное значение (128 GB = 256M секторов)
-    Ok(256 * 1024 * 1024)
+    // SCSI READ CAPACITY(10) - opcode 0x25
+    // CDB: [0x25, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]
+    // PMI=0 (byte 1 bit 0) = return last LBA
+    // LBA=0 (bytes 2-5)
+    let mut resp = [0u8; 8];
+    ufs_scsi_cmd_raw(&[0x25, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00], 
+                     ScsiDir::In, &mut resp, 8)?;
+    
+    let last_lba = u32::from_be_bytes([resp[0], resp[1], resp[2], resp[3]]);
+    let block_size = u32::from_be_bytes([resp[4], resp[5], resp[6], resp[7]]);
+    
+    if block_size != 512 {
+        kprintln!("ufs: unexpected block size {}", block_size);
+    }
+    
+    // Capacity in sectors = last LBA + 1
+    Ok((last_lba as u64) + 1)
 }
