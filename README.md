@@ -53,37 +53,6 @@ LOAD_BASE=0x... make build   # должен быть кратен 2 MiB и ра�
 
 ---
 
-## Архитектура UFS
-
-```
-┌─────────────────┐
-│   Kernel        │
-│  (initramfs)    │
-└────────┬────────┘
-         │ ufs_read_sectors()
-┌────────▼────────┐
-│  UFS Driver     │
-│  - SCSI layer   │
-│  - UTRD/UCD     │
-└────────┬────────┘
-         │ MMIO
-┌────────▼────────┐
-│  UFS HC         │  @ 0x4804000
-│  (UFSHCI v3.0)  │
-└────────┬────────┘
-         │ UniPro/MPHY
-┌────────▼────────┐
-│  UFS PHY        │  @ 0x4807000
-│  (QMP v4)       │
-└────────┬────────┘
-         │
-┌────────▼────────┐
-│  UFS Storage    │  128GB NAND
-└─────────────────┘
-```
-
----
-
 ## API
 
 ### `ufs_read_sectors(lba: u64, count: u16, buf: &mut [u8])`
@@ -173,7 +142,7 @@ ufsphy_mem@4807000 {
 - UFS не пробируется (нет узла в DTB) ✅
 - `stage 8 OK` работает с RAM initramfs ✅
 
-### На железе (Poco X4 Pro):
+### На железе:
 1. Загрузчик включает UFS в DTB (`status = "okay"`)
 2. Передаёт корректный DTB с узлами `qcom,ufshc` и `qcom,ufs-phy-qmp-v4`
 3. Ядро пробирует UFS драйвер → `ufs: probe ok`
