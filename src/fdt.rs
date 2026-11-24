@@ -38,6 +38,10 @@ pub struct BootInfo {
     /// Диапазоны из reserved-memory с `no-map` (их нельзя отображать в MMU).
     pub no_map: [(u64, u64); MAX_NOMAP],
     pub no_map_n: usize,
+    /// ВСЕ диапазоны /reserved-memory (включая без no-map): Linux не выдаёт их
+    /// аллокатору. На SM6375 там livetimer, cont_splash, dma-pools и др.
+    pub reserved: [(u64, u64); MAX_NOMAP],
+    pub reserved_n: usize,
     pub pl011: Option<usize>,
     pub gic: Option<GicInfo>,
     /// INTID физического таймера EL1 (из узла arm,armv8-timer).
@@ -53,6 +57,10 @@ pub struct BootInfo {
     /// Initramfs: физический адрес начала и конца (из /chosen/linux,initrd-start/end).
     pub initrd_start: Option<usize>,
     pub initrd_end: Option<usize>,
+    /// GENI SE UART-консоль SM6375 (compatible "qcom,msm-geni-console", status ok).
+    pub geni_uart: Option<usize>,
+    /// APSS watchdog (compatible "qcom,msm-watchdog") — база для отключения.
+    pub wdt: Option<usize>,
 }
 
 struct Node<'a> {
@@ -66,6 +74,12 @@ struct Node<'a> {
     is_cpu: bool,
     is_virtio_mmio: bool,
     is_chosen: bool,
+    is_geni_uart: bool,
+    is_watchdog: bool,
+    /// Родитель — /reserved-memory
+    is_reserved: bool,
+    /// status == "disabled" — узел не трогаем.
+    disabled: bool,
     enable_psci: bool,
     interrupts: Option<&'a [u8]>,
     method: Option<&'a [u8]>,
@@ -85,6 +99,10 @@ impl<'a> Node<'a> {
             is_cpu: false,
             is_virtio_mmio: false,
             is_chosen: false,
+            is_geni_uart: false,
+            is_watchdog: false,
+            is_reserved: false,
+            disabled: false,
             enable_psci: false,
             interrupts: None,
             method: None,
@@ -177,6 +195,10 @@ fn finalize(info: &mut BootInfo, n: &Node, (ac, sc): (usize, usize)) {
             info.ram[info.ram_n] = (b, sz);
             info.ram_n += 1;
         }
+        if n.is_reserved && info.reserved_n < MAX_NOMAP {
+            info.reserved[info.reserved_n] = (b, sz);
+            info.reserved_n += 1;
+        }
         if n.no_map && info.no_map_n < MAX_NOMAP {
             info.no_map[info.no_map_n] = (b, sz);
             info.no_map_n += 1;
@@ -193,6 +215,12 @@ fn finalize(info: &mut BootInfo, n: &Node, (ac, sc): (usize, usize)) {
     }
     if n.is_pl011 && info.pl011.is_none() {
         info.pl011 = Some(base as usize);
+    }
+    if n.is_geni_uart && info.geni_uart.is_none() && !n.disabled {
+        info.geni_uart = Some(base as usize);
+    }
+    if n.is_watchdog && info.wdt.is_none() && !n.disabled {
+        info.wdt = Some(base as usize);
     }
     if n.is_virtio_mmio && info.virtio_mmio_n < MAX_VIRTIO_MMIO {
         let irq = n
@@ -244,6 +272,8 @@ pub fn parse(dtb: usize) -> Option<BootInfo> {
         ram_n: 0,
         no_map: [(0, 0); MAX_NOMAP],
         no_map_n: 0,
+        reserved: [(0, 0); MAX_NOMAP],
+        reserved_n: 0,
         pl011: None,
         gic: None,
         timer_intid: None,
@@ -254,9 +284,13 @@ pub fn parse(dtb: usize) -> Option<BootInfo> {
         virtio_mmio_n: 0,
         initrd_start: None,
         initrd_end: None,
+        geni_uart: None,
+        wdt: None,
     };
     let mut cells = [(2usize, 1usize); MAX_DEPTH + 1];
     let mut depth = 0usize;
+    // Глубина узла /reserved-memory (если встретился)
+    let mut reserved_at: Option<usize> = None;
     let mut node = Node::new();
     let mut pending = false;
     let mut p = off_struct;
@@ -288,12 +322,20 @@ pub fn parse(dtb: usize) -> Option<BootInfo> {
                 node.is_psci = name == b"psci";
                 node.is_cpu = name.starts_with(b"cpu@");
                 node.is_chosen = name == b"chosen";
+                // Дочерние узлы /reserved-memory резервируем целиком
+                node.is_reserved = reserved_at == Some(depth.wrapping_sub(1));
+                if name == b"reserved-memory" {
+                    reserved_at = Some(depth);
+                }
                 pending = true;
             }
             TOK_END_NODE => {
                 if pending {
                     finalize(&mut info, &node, cells[depth - 1]);
                     pending = false;
+                }
+                if Some(depth) == reserved_at {
+                    reserved_at = None;
                 }
                 if depth == 0 {
                     break;
@@ -324,6 +366,7 @@ pub fn parse(dtb: usize) -> Option<BootInfo> {
                     b"method" => node.method = Some(data),
                     b"cpu_on" => node.cpu_on = Some(read_u64_prop(data)),
                     b"enable-method" => node.enable_psci = data.starts_with(b"psci"),
+                    b"status" => node.disabled = data.starts_with(b"disabled"),
                     b"device_type" => {
                         if data.starts_with(b"memory") {
                             node.is_mem = true;
@@ -337,6 +380,8 @@ pub fn parse(dtb: usize) -> Option<BootInfo> {
                             || has_compat(data, b"arm,psci-0.2")
                             || has_compat(data, b"arm,psci");
                         node.is_virtio_mmio |= has_compat(data, b"virtio,mmio");
+                        node.is_geni_uart |= has_compat(data, b"qcom,msm-geni-console");
+                        node.is_watchdog |= has_compat(data, b"qcom,msm-watchdog");
                     }
                     b"linux,initrd-start" if node.is_chosen && len >= 4 => {
                         info.initrd_start = Some(read_u64_prop(data) as usize);
@@ -640,6 +685,13 @@ fn finalize_platform_node<'a>(node: &PlatformNode<'a>, strings: &'a [u8], ac_sc:
         let s = unsafe { core::str::from_utf8_unchecked(node.compat[i]) };
         compat_arr[i] = unsafe { core::mem::transmute::<&str, &'static str>(s) };
     }
+
+    // Фильтр: регистрируем только если драйвер уже зарегистрирован и
+    // поддерживает узел. Иначе реестр переполняется на реальном DTB.
+    if !platform::driver_interested(&compat_arr, node.compat_n) {
+        return;
+    }
+
     let dev = platform::PlatformDevice {
         name: name_str,
         compatible: compat_arr,

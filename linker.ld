@@ -30,6 +30,15 @@ SECTIONS
         . = ALIGN(4096);
     }
 
+    /* Функции-конструкторы регистрации драйверов (#[link_section = ".init_array"]).
+       Собираются явно и вызываются из kernel_main через run_init_array(). */
+    .init_array : ALIGN(8)
+    {
+        __init_array_start = .;
+        KEEP(*(.init_array .init_array.*))
+        __init_array_end = .;
+    }
+
     .bss (NOLOAD) : ALIGN(4096)
     {
         __bss_start = .;

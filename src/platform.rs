@@ -217,6 +217,17 @@ pub fn platform_probe_all() -> usize {
 
         let Some(drv) = drv else { continue };
 
+        // MMIO-ресурсы устройства должны быть в identity-map ДО probe:
+        // на реальном железе регионы (GCC/SPMI/UFS...) не входят в стартовый
+        // mmio-список main.rs, и обращение к ним без маппинга = data abort.
+        for i in 0..dev.resources_n {
+            if let Resource::Mem { base, size } = dev.resources[i] {
+                if size != 0 {
+                    crate::mmu::map_device_identity(base, base + size);
+                }
+            }
+        }
+
         // Обновляем статус под локом
         {
             let mut devices = DEVICES.lock();
@@ -284,6 +295,25 @@ pub fn platform_init(fdt_addr: usize) {
     }
     // Парсинг DT и регистрация устройств будет в fdt.rs
     crate::fdt::platform_populate(fdt_addr);
+}
+
+/// Есть ли среди зарегистрированных драйверов поддерживающий хотя бы один
+/// из данных compatible. platform_populate использует это как фильтр:
+/// в реальном DTB SM6375 сотни узлов с compatible, а реестр устройств
+/// ограничен (MAX_DEVICES) — без фильтра до GCC/SPMI/UFS очередь не дошла бы.
+pub fn driver_interested(compat: &[&str], n: usize) -> bool {
+    if n == 0 {
+        return false;
+    }
+    let drivers = DRIVERS.lock();
+    drivers
+        .iter()
+        .flatten()
+        .any(|drv| {
+            drv.compatible[..drv.compatible_n]
+                .iter()
+                .any(|c| !c.is_empty() && compat[..n].contains(c))
+        })
 }
 
 /// Инициализация драйверов (после platform_init, когда PMIC/GCC доступны)

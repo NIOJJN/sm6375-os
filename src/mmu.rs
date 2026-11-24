@@ -354,6 +354,33 @@ pub unsafe fn enable_kernel_mmu(
     (root, asid)
 }
 
+/// Добавляет identity-мэппинг Device для диапазона [start, end) в ЖИВУЮ таблицу
+/// ядра (после включения MMU). Нужен для MMIO-регионов устройств, обнаруженных
+/// платформенным enumerate уже после загрузки таблиц — иначе обращение драйвера
+/// к unmapped-адресу вызовет data abort.
+pub fn map_device_identity(start: usize, end: usize) -> bool {
+    let root = KROOT.load(Ordering::Relaxed);
+    if root == 0 || end <= start {
+        return false;
+    }
+    let mut m = Mapper {
+        root: root as *mut u64,
+    };
+    unsafe { m.map(start, end, Mem::Device) };
+    // Полная инвалидация TLB EL1 (inner shareable): probe происходит один раз
+    // при загрузке, поэтому дешевизна не критична.
+    unsafe {
+        asm!(
+            "dsb ishst",
+            "tlbi vmalle1is",
+            "dsb ish",
+            "isb",
+            options(nostack),
+        );
+    }
+    true
+}
+
 /// Включает MMU и кэши на вторичном CPU с уже построенной корневой таблицей.
 pub unsafe fn enable_secondary(root: usize, asid: usize) {
     enable(root, asid);

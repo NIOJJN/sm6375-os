@@ -8,7 +8,9 @@ use crate::sync::SpinLock;
 use core::ptr::{read_volatile, write_bytes, write_volatile};
 
 pub const PAGE_SIZE: usize = 4096;
-const MAX_RES: usize = 80;
+/// Вместимость списка исключений: ядро + DTB + no-map + вся reserved-memory
+/// (на SM6375 ~20+ регионов).
+const MAX_RES: usize = 256;
 
 struct Pmm {
     next: usize,

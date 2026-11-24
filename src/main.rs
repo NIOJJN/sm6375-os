@@ -26,6 +26,7 @@ mod port;
 mod syscall;
 mod timer;
 mod uart;
+mod wdt;
 
 use core::arch::{asm, global_asm};
 use core::panic::PanicInfo;
@@ -87,22 +88,54 @@ fn pmm_selftest() {
     }
 }
 
+/// Вызывает функции-конструкторы из .init_array — регистрацию драйверов
+/// (см. #[link_section = ".init_array"] в src/drivers/*).
+unsafe fn run_init_array() {
+    extern "C" {
+        static __init_array_start: u8;
+        static __init_array_end: u8;
+    }
+    let start = &__init_array_start as *const u8 as usize;
+    let end = &__init_array_end as *const u8 as usize;
+    let mut p = start;
+    while p + 8 <= end {
+        let f: fn() = core::mem::transmute((p as *const usize).read());
+        f();
+        p += 8;
+    }
+}
+
 #[no_mangle]
 pub extern "C" fn kernel_main(dtb: usize) -> ! {
     smp::init_boot_cpu();
+    // Регистрация платформенных драйверов (gcc/spmi/pmic/uart/ufs) до
+    // platform_init: platform_populate фильтрует узлы DT по зарегистрированным
+    // драйверам.
+    unsafe { run_init_array() };
     let info = fdt::parse(dtb);
+
+    // Отключаем APSS watchdog до любых потенциально зависающих действий
+    // (на QEMU virt узла нет — skip).
+    if let Some(w) = info.as_ref().and_then(|i| i.wdt) {
+        wdt::disable(w);
+    }
 
     let uart = info.as_ref().and_then(|i| i.pl011).map(|base| {
         let u = uart::Pl011::new(base);
         unsafe { u.init() };
         u
     });
+    // GENI SE UART — консоль реального железа (SM6375), ранний вывод
+    if let Some(g) = info.as_ref().and_then(|i| i.geni_uart) {
+        crate::drivers::geni_uart::early_init(g);
+    }
 
-    console::init(uart);
+    console::init(uart, info.as_ref().and_then(|i| i.geni_uart));
 
     kprintln!("mk: stage 8 boot");
     kprintln!("EL{}  MPIDR={:#x}", current_el(), mpidr());
     let Some(info) = info else {
+        console::emergency_write(b"[boot] DTB PARSE FAILED\n");
         kprintln!("DTB invalid, x0={:#x}", dtb);
         halt()
     };
@@ -110,13 +143,18 @@ pub extern "C" fn kernel_main(dtb: usize) -> ! {
     for &(b, s) in &info.ram[..info.ram_n] {
         kprintln!("RAM  {:#x} + {:#x}", b, s);
     }
-    kprintln!("no-map regions: {}", info.no_map_n);
+    kprintln!("no-map regions: {}, reserved total: {}", info.no_map_n, info.reserved_n);
 
     // ---- MMU ----
-    let mut mmio = [(0usize, 0usize); 3 + fdt::MAX_VIRTIO_MMIO];
+    let mut mmio = [(0usize, 0usize); 4 + fdt::MAX_VIRTIO_MMIO];
     let mut np = 0;
     for &m in [info.pl011].iter().flatten() {
         mmio[np] = (m, 0x1000);
+        np += 1;
+    }
+    if let Some(g) = info.geni_uart {
+        // GENI SE UART: узел в DTB обычно 0x4000, маппим столько же
+        mmio[np] = (g, 0x4000);
         np += 1;
     }
     if let Some(g) = info.gic {
@@ -135,13 +173,21 @@ pub extern "C" fn kernel_main(dtb: usize) -> ! {
     }
     // ---- Физический аллокатор (нужен до MMU, т.к. таблицы страниц аллоцируются из PMM) ----
     let (ks, ke) = mmu::kernel_range();
-    let mut res = [(0usize, 0usize); 70];
+    let mut res = [(0usize, 0usize); 128];
     let mut rn = 0;
     res[rn] = (ks, ke);
     rn += 1;
     res[rn] = (info.dtb, info.dtb + info.dtb_size);
     rn += 1;
     for &(b, s) in &info.no_map[..info.no_map_n] {
+        if rn < res.len() {
+            res[rn] = (b as usize, (b + s) as usize);
+            rn += 1;
+        }
+    }
+    // ВСЯ reserved-memory (не только no-map) — прошивка живёт и в обычных
+    // резервах (smem, cont_splash, dma-pools на SM6375).
+    for &(b, s) in &info.reserved[..info.reserved_n] {
         if rn < res.len() {
             res[rn] = (b as usize, (b + s) as usize);
             rn += 1;
