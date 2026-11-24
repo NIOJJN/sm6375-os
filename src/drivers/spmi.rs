@@ -203,6 +203,7 @@ fn spmi_probe(dev: &PlatformDevice) -> Result<(), DriverError> {
 
     spmi_init(base)?;
     kprintln!("spmi: probe ok, base={:#x}, size={:#x}", base, size);
+    crate::drivers::vibro::indicate(crate::drivers::vibro::BootStage::SpmiProbe);
     Ok(())
 }
 

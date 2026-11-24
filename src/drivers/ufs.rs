@@ -244,6 +244,7 @@ fn ufs_probe(dev: &PlatformDevice) -> Result<(), DriverError> {
     }
     
     // Инициализация PHY
+    crate::drivers::vibro::indicate(crate::drivers::vibro::BootStage::UfsInit);
     ufs_phy_init()?;
     
     // Запрашиваем SMMU bypass для нашего SID (0x60 = 96)

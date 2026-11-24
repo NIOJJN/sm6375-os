@@ -212,6 +212,7 @@ fn gcc_probe(dev: &PlatformDevice) -> Result<(), DriverError> {
     // Базовая проверка: читаем какой-нибудь регистр
     let _ = gcc_read(0x0);
     kprintln!("gcc-sm6375: probe ok");
+    crate::drivers::vibro::indicate(crate::drivers::vibro::BootStage::GccProbe);
 
     Ok(())
 }

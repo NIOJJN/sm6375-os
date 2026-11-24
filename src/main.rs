@@ -118,6 +118,7 @@ pub extern "C" fn kernel_main(dtb: usize) -> ! {
     // (на QEMU virt узла нет — skip).
     if let Some(w) = info.as_ref().and_then(|i| i.wdt) {
         wdt::disable(w);
+        crate::drivers::vibro::indicate(crate::drivers::vibro::BootStage::WdtOff);
     }
 
     let uart = info.as_ref().and_then(|i| i.pl011).map(|base| {
@@ -222,6 +223,7 @@ pub extern "C" fn kernel_main(dtb: usize) -> ! {
     port::init();
     ipc::init();
     initramfs::init(&info);
+    crate::drivers::vibro::indicate(crate::drivers::vibro::BootStage::InitramfsOk);
 
     // ---- Platform device model (Qualcomm SM6375) ----
     // Парсинг DT и регистрация platform устройств

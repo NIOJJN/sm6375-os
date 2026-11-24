@@ -7,3 +7,4 @@ pub mod pmic_sm6375;
 pub mod smmu;
 pub mod spmi;
 pub mod ufs;
+pub mod vibro;

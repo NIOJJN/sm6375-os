@@ -200,6 +200,9 @@ fn pmic_probe(dev: &PlatformDevice) -> Result<(), DriverError> {
     // Включаем критические rails
     pmic_enable_critical_rails()?;
 
+    // Инициализируем вибромотор (GPIO 13 на PMI8998 — подстроить под board)
+    crate::drivers::vibro::vibro_init(13);
+
     kprintln!("pmic: probe ok");
     Ok(())
 }
