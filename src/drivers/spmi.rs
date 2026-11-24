@@ -207,8 +207,8 @@ fn spmi_probe(dev: &PlatformDevice) -> Result<(), DriverError> {
 }
 
 static SPMI_DRIVER: Driver = Driver {
-    name: "spmi-geni",
-    compatible: ["qcom,spmi-geni", "qcom,geni-spmi", "", "", "", "", "", ""],
+    name: "spmi-pmic-arb",
+    compatible: ["qcom,spmi-pmic-arb", "qcom,spmi-geni", "", "", "", "", "", ""],
     compatible_n: 2,
     probe: spmi_probe,
     remove: None,

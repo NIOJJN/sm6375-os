@@ -1,6 +1,6 @@
-//! GCC SM6375 — Global Clock Controller для Snapdragon 695 (SM6375)
+//! GCC SM6375 (Blair) — Global Clock Controller для Snapdragon 695 (SM6375)
 //!
-//! Базовый адрес: 0x0880_0000 (GCC)
+//! Базовый адрес берётся из DT (reg property): обычно 0x1400000 (blair-gccsyscon)
 //! Регистры: CLK_ENABLE, CLK_DISABLE, CLK_STATUS, CLK_FREQ, CLK_DIV, PLL_MODE, BCMD
 //!
 //! Источник: Linux drivers/clk/qcom/gcc-sm6375.c + Technical Reference Manual
@@ -9,9 +9,8 @@ use crate::platform::{self, Driver, DriverError, PlatformDevice, ProbeStatus, Re
 use crate::sync::SpinLock;
 use core::sync::atomic::{AtomicBool, Ordering};
 
-// GCC базовые адреса
-const GCC_BASE: usize = 0x0880_0000;
-const GCC_SIZE: usize = 0x100_000; // 1 MB
+// GCC базовый адрес будет взят из DT при probe
+static GCC_BASE: SpinLock<Option<usize>> = SpinLock::new(None);
 
 // Регистры GCC (offset от GCC_BASE)
 mod reg {
@@ -217,11 +216,11 @@ fn gcc_probe(dev: &PlatformDevice) -> Result<(), DriverError> {
     Ok(())
 }
 
-/// Драйвер GCC
+/// Драйвер GCC (Blair / SM6375)
 static GCC_DRIVER: Driver = Driver {
-    name: "gcc-sm6375",
-    compatible: ["qcom,gcc-sm6375", "", "", "", "", "", "", ""],
-    compatible_n: 1,
+    name: "gcc-blair",
+    compatible: ["qcom,blair-gccsyscon", "qcom,gcc-sm6375", "", "", "", "", "", ""],
+    compatible_n: 2,
     probe: gcc_probe,
     remove: None,
 };

@@ -316,9 +316,9 @@ pub fn msm_uart_late_getc() -> Option<u8> {
 }
 
 static MSM_UART_DRIVER: Driver = Driver {
-    name: "msm-uart",
-    compatible: ["qcom,msm-uart", "qcom,msm-serial", "", "", "", "", "", ""],
-    compatible_n: 2,
+    name: "msm-geni-serial",
+    compatible: ["qcom,msm-geni-serial-hs", "qcom,msm-uart", "qcom,msm-serial", "", "", "", "", ""],
+    compatible_n: 3,
     probe: msm_uart_probe,
     remove: None,
 };
