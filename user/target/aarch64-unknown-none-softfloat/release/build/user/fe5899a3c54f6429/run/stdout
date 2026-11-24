@@ -1,0 +1,2 @@
+cargo:rustc-link-arg=-T/mnt/d/TestingSuite/rustos/user/link.ld
+cargo:rerun-if-changed=link.ld

@@ -1,0 +1,20 @@
+[package]
+name = "user"
+version = "0.1.0"
+edition = "2021"
+build = "build.rs"
+
+[dependencies]
+
+# Отдельный корень: каталог лежит внутри проекта ядра, но собирается независимо.
+[workspace]
+
+[profile.dev]
+panic = "abort"
+
+[profile.release]
+panic = "abort"
+opt-level = "s"
+lto = true
+codegen-units = 1
+debug = false

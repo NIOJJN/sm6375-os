@@ -1,0 +1,7 @@
+/target
+*.img
+kernel.bin
+initramfs.cpio
+initramfs.cpio.gz
+make_initramfs_host
+src/drivers/KEY
