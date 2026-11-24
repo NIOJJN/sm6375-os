@@ -508,6 +508,7 @@ pub fn platform_populate(dtb: usize) {
                     b"clocks" => node.clocks = Some(data),
                     b"clock-names" => node.clock_names = Some(data),
                     b"power-domains" => node.power_domains = Some(data),
+                    b"iommus" => node.iommus = Some(data),
                     b"status" => node.status = Some(data),
                     _ => {}
                 }
@@ -533,6 +534,7 @@ struct PlatformNode<'a> {
     clock_names: Option<&'a [u8]>,
     power_domains: Option<&'a [u8]>,
     status: Option<&'a [u8]>,
+    iommus: Option<&'a [u8]>,
 }
 
 impl<'a> PlatformNode<'a> {
@@ -547,6 +549,7 @@ impl<'a> PlatformNode<'a> {
             clock_names: None,
             power_domains: None,
             status: None,
+            iommus: None,
         }
     }
 }
@@ -663,6 +666,23 @@ fn finalize_platform_node<'a>(node: &PlatformNode<'a>, strings: &'a [u8], ac_sc:
                 let phandle = be32(pds, i * 4);
                 if res_n < MAX_RES {
                     resources[res_n] = platform::Resource::PowerDomain { name: "", id: phandle as usize };
+                    res_n += 1;
+                }
+            }
+        }
+    }
+
+    // IOMMU/SMMU (iommus property: <phandle sid mask> per entry, 3 cells = 12 bytes)
+    if let Some(ims) = node.iommus {
+        // iommus: массив phandle + sid + mask (3 u32 per entry)
+        if ims.len() % 12 == 0 {
+            let count = ims.len() / 12;
+            for i in 0..count {
+                let phandle = be32(ims, i * 12) as usize;
+                let sid = be32(ims, i * 12 + 4);
+                let mask = be32(ims, i * 12 + 8);
+                if res_n < MAX_RES {
+                    resources[res_n] = platform::Resource::Iommu { phandle, sid, mask };
                     res_n += 1;
                 }
             }

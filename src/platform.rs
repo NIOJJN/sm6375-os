@@ -28,6 +28,8 @@ pub enum Resource {
     Irq(IrqSpec),
     Clock { name: &'static str, id: usize },
     PowerDomain { name: &'static str, id: usize },
+    /// IOMMU/SMMU: phandle контроллера, SID (Stream ID), mask (опционально)
+    Iommu { phandle: usize, sid: u32, mask: u32 },
 }
 
 /// Статус пробирования
@@ -111,6 +113,16 @@ impl PlatformDevice {
                 if *n == name {
                     return Some(*id);
                 }
+            }
+        }
+        None
+    }
+
+    /// Получить SID (Stream ID) из iommus ресурса (первый найденный)
+    pub fn get_resource_sid(&self) -> Option<u32> {
+        for r in &self.resources[..self.resources_n] {
+            if let Resource::Iommu { sid, .. } = r {
+                return Some(*sid);
             }
         }
         None

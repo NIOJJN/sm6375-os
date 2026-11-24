@@ -4,6 +4,7 @@
 !gen_fake_dtb.py
 !patch_dtb.py
 fake_sm6375.dtb
+vendor_dtb
 kernel.bin
 initramfs.cpio
 initramfs.cpio.gz

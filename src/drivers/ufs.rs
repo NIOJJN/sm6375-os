@@ -246,6 +246,12 @@ fn ufs_probe(dev: &PlatformDevice) -> Result<(), DriverError> {
     // Инициализация PHY
     ufs_phy_init()?;
     
+    // Запрашиваем SMMU bypass для нашего SID (0x60 = 96)
+    // Это должно произойти ДО HC init, иначе DMA упадёт
+    if let Some(sid) = dev.get_resource_sid() {
+        crate::drivers::smmu::smmu_request_bypass(sid);
+    }
+    
     // Инициализация Host Controller
     ufs_hc_init()?;
     
