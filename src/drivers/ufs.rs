@@ -257,6 +257,10 @@ fn ufs_probe(dev: &PlatformDevice) -> Result<(), DriverError> {
     ufs_hc_init()?;
     
     kprintln!("ufs: probe ok");
+    
+    // Инициализируем GPT parser для поиска ESP
+    let _ = crate::drivers::gpt::gpt_init();
+    
     Ok(())
 }
 
