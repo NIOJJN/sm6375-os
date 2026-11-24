@@ -1,7 +1,12 @@
 /target
 *.img
+*.py
+!gen_fake_dtb.py
+!patch_dtb.py
+fake_sm6375.dtb
 kernel.bin
 initramfs.cpio
 initramfs.cpio.gz
+initramfs_tmp/
 make_initramfs_host
 src/drivers/KEY

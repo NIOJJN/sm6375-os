@@ -28,7 +28,15 @@ run: build initramfs
 run-el2: build initramfs
 > $(QEMU),virtualization=on
 
-bootimg: build
-> mkbootimg --header_version 4 --kernel $(BIN) --os_version 14.0.0 --os_patch_level 2026-11 -o boot.img
+# Репетиция телефонного пути: fake DTB в форме SM6375 (geni-console, WDT,
+# GCC/SPMI/UFS с runtime-мэппингом MMIO, no-map резерв). См. gen_fake_dtb.py.
+run-dtb: build initramfs
+> qemu-system-aarch64 -machine virt,gic-version=3 -cpu max -m 512M -smp 4 -serial stdio -initrd $(INITRD) -kernel $(BIN) -dtb fake_sm6375.dtb
+
+# boot.img v4 для `fastboot boot boot.img` (разовая загрузка без прошивки).
+# DTB при v3/v4 берётся из vendor_boot-раздела телефона (там консольный
+# GENI UART уже status="ok"), поэтому в boot.img нужен только kernel+ramdisk.
+bootimg: build initramfs
+> mkbootimg --header_version 4 --kernel $(BIN) --ramdisk $(INITRD) --os_version 14.0.0 --os_patch_level 2026-11 -o boot.img
 
 .PHONY: build initramfs run run-el2 bootimg
