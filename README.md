@@ -1,7 +1,6 @@
 # vv1raos
 
 Автономное (standalone) bare-metal ядро для AArch64 на Rust. Не зависит от Android:
-нет Binder, нет `mkbootimg`, нет `boot.img`, нет пользовательского пространства Android.
 Ядро собирается стабильным Rust и запускается под QEMU (машина `virt`).
 
 ## Сборка
