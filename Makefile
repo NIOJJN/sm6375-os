@@ -33,15 +33,14 @@ run-el2: build initramfs
 run-dtb: build initramfs
 > qemu-system-aarch64 -machine virt,gic-version=3 -cpu max -m 512M -smp 4 -serial stdio -initrd $(INITRD) -kernel $(BIN) -dtb fake_sm6375.dtb
 
-# boot.img v4 для `fastboot boot boot.img` (разовая загрузка без прошивки).
-# Poco X4 Pro (SM6375/Blair) параметры:
-#   base: 0x40000000
-#   page_size: 4096
-#   kernel_offset: 0x80000
-#   tags_offset: 0x01E00000
-#   header_version: 4
-# DTB берётся из vendor_boot (нужен наш пропатченный vendor_boot_patched.img).
+# boot.img v4 для `fastboot boot boot.img` на Poco X4 Pro (SM6375/Blair).
+# DDR base = 0x80000000, kernel LOAD_BASE = 0x80080000 (text_offset=0x80000).
+# DTB берётся из vendor_boot_patched.img (там консольный GENI UART status="ok").
 bootimg: build initramfs
-> mkbootimg --header_version 4 --kernel $(BIN) --ramdisk $(INITRD) --base 0x40000000 --pagesize 4096 --kernel_offset 0x80000 --tags_offset 0x01E00000 --os_version 14.0.0 --os_patch_level 2026-11 -o boot.img
+> mkbootimg --header_version 4 --kernel $(BIN) --ramdisk $(INITRD) --base 0x80000000 --pagesize 4096 --kernel_offset 0x80000 --tags_offset 0x01E00000 --os_version 14.0.0 --os_patch_level 2026-11 -o boot.img
+
+# boot.img для QEMU virt (тестирование)
+bootimg-qemu: build initramfs
+> mkbootimg --header_version 4 --kernel $(BIN) --ramdisk $(INITRD) --base 0x40000000 --pagesize 4096 --kernel_offset 0x80000 --tags_offset 0x01E00000 --os_version 14.0.0 --os_patch_level 2026-11 -o boot-qemu.img
 
 .PHONY: build initramfs run run-el2 bootimg

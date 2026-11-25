@@ -1,13 +1,13 @@
-// Точка входа AArch64. Начинается с заголовка arm64 Image (64 байта), чтобы
-// загрузчики (QEMU, ABL) могли определить размер образа и смещение.
+// Точка входа AArch64. Заголовок arm64 Image (64 байта) для ABL/fastboot.
+// LOAD_BASE = 0x80080000 (DDR на SM6375 начинается с 0x80000000, text_offset = 0x80000)
 
 .section .text.boot, "ax"
 .global _start
 _start:
     b       _real_start             // code0
     .long   0                       // code1
-    .quad   0x80000                 // text_offset (LOAD_BASE = 0x80000 mod 2MiB)
-    .quad   __image_size            // effective image size (с .bss и стеком)
+    .quad   0x80000                 // text_offset (LOAD_BASE = 0x80080000)
+    .quad   __image_size            // effective image size
     .quad   0x2                     // flags: little-endian, 4K pages
     .quad   0                       // res2
     .quad   0                       // res3
@@ -16,58 +16,39 @@ _start:
     .long   0                       // res5
 
 _real_start:
-    mov     x19, x0                 // x19 = указатель на DTB (callee-saved, переживает eret)
-    msr     daifset, #0xf           // маскируем D, A, I, F
+    mov     x19, x0                 // x19 = DTB pointer (callee-saved)
+    msr     daifset, #0xf           // mask D, A, I, F
 
-    // STAGE 0: Boot CPU detected
-    mov     x0, #0x40000000         // Known address for stage marker
-    mov     x1, #0x1
-    str     x1, [x0]
-
-    // Работаем только на загрузочном ядре (Aff2:Aff0 == 0), остальные паркуем.
-    mrs     x1, mpidr_el1
-    and     x1, x1, #0xffffff
-    cbnz    x1, park
-
-    // STAGE 1: Primary CPU confirmed
-    mov     x0, #0x40000000
-    mov     x1, #0x2
-    str     x1, [x0]
-
+    // Skip MPIDR check (SM6375 CPU0 has Aff1=1)
     mrs     x0, CurrentEL
     lsr     x0, x0, #2
     cmp     x0, #2
     b.eq    el2_entry
     cmp     x0, #1
     b.eq    el1_entry
-    b       park                    // EL3/EL0 не поддерживаются
+    b       park
 
 // ---- EL2 -> EL1 ----
 el2_entry:
-    // STAGE 2: EL2 entry
-    mov     x0, #0x40000000
-    mov     x1, #0x3
-    str     x1, [x0]
-
-    mov     x0, #(1 << 31)          // HCR_EL2.RW = 1: EL1 работает в AArch64
+    mov     x0, #(1 << 31)          // HCR_EL2.RW = 1
     msr     hcr_el2, x0
 
-    mrs     x0, cnthctl_el2         // не ловим доступ EL1 к счётчику/таймеру
+    mrs     x0, cnthctl_el2
     orr     x0, x0, #3
     msr     cnthctl_el2, x0
     msr     cntvoff_el2, xzr
 
-    mrs     x0, midr_el1            // виртуальные ID для EL1
+    mrs     x0, midr_el1
     msr     vpidr_el2, x0
     mrs     x0, mpidr_el1
     msr     vmpidr_el2, x0
 
-    mov     x0, #0x32ff             // CPTR_EL2: RES1, без ловушек FP/SIMD/SVE
+    mov     x0, #0x32ff
     msr     cptr_el2, x0
     msr     hstr_el2, xzr
     msr     mdcr_el2, xzr
 
-    // Разрешаем EL1 доступ к системным регистрам GICv3 (ICC_SRE_EL2 = SRE|DFB|DIB|Enable)
+    // GICv3 system register access
     mrs     x0, id_aa64pfr0_el1
     ubfx    x0, x0, #24, #4
     cbz     x0, 1f
@@ -83,35 +64,28 @@ el2_entry:
 
 // ---- EL1 ----
 el1_entry:
-    // STAGE 3: EL1 entry
-    mov     x0, #0x40000000
-    mov     x1, #0x4
-    str     x1, [x0]
-
-    // SCTLR_EL1: MMU, кэши, выравнивание-проверки выключены (только RES1 биты)
+    // SCTLR_EL1: MMU/Caches OFF, alignment checks OFF
     mov     x0, #0x0800
     movk    x0, #0x30d0, lsl #16
     msr     sctlr_el1, x0
     isb
 
+    // Stack
     adrp    x0, __stack_top
     add     x0, x0, :lo12:__stack_top
     mov     sp, x0
 
+    // VBAR
     adrp    x0, vectors
     add     x0, x0, :lo12:vectors
     msr     vbar_el1, x0
 
-    mov     x0, #(3 << 20)          // CPACR_EL1.FPEN = 0b11
+    // FP/SIMD
+    mov     x0, #(3 << 20)
     msr     cpacr_el1, x0
     isb
 
-    // STAGE 4: Before bss clear
-    mov     x0, #0x40000000
-    mov     x1, #0x5
-    str     x1, [x0]
-
-    // Очистка .bss
+    // Clear BSS
     adrp    x0, __bss_start
     add     x0, x0, :lo12:__bss_start
     adrp    x1, __bss_end
@@ -123,39 +97,30 @@ el1_entry:
     b       2b
 3:
 
-    // STAGE 6: Before kernel_main
-    mov     x0, #0x40000000
-    mov     x1, #0x6
-    str     x1, [x0]
-
-    mov     x0, x19                 // аргумент: указатель на DTB
+    mov     x0, x19                 // DTB pointer
     bl      kernel_main
+
 park:
     wfe
     b       park
 
-// ---- Таблица векторов исключений (диагностика: печать и останов) ----
+// ==== Exception vectors ====
 .macro ventry idx
     .balign 0x80
     mov     x0, #\idx
     b       exc_common
 .endm
 
-// Слот IRQ: сохранить контекст и вызвать Rust-обработчик
 .macro ventry_irq
     .balign 0x80
     b       irq_entry
 .endm
 
-// Слот IRQ из EL0: отдельная точка входа, чтобы планировщик знал, что
-// прерывание пришло из пользовательского режима (spsr_el1 при IRQ из EL1
-// содержит устаревшее значение).
 .macro ventry_irq_lower
     .balign 0x80
     b       irq_entry_lower
 .endm
 
-// Слот синхронного исключения из EL0 (svc, аборты)
 .macro ventry_sync_lower
     .balign 0x80
     b       sync_lower_entry
@@ -182,12 +147,13 @@ vectors:
     ventry  15
 
 exc_common:
-    // CRASH SIGNATURE: write pattern before Rust handler
-    mov     x0, #0x40000000
+    // Crash signature: 0xDEADBEEF at known address
+    // Используем адрес в пределах загруженного образа (после image_size)
+    adrp    x0, __kernel_end
+    add     x0, x0, #0x1000
     mov     x1, #0xDEAD
+    movk    x1, #0xBEEF, lsl #16
     str     x1, [x0]
-    mov     x1, #0xBEEF
-    str     x1, [x0, #8]
 
     mrs     x1, esr_el1
     mrs     x2, elr_el1
@@ -198,7 +164,6 @@ exc_common:
     bl      exception_handler
     b       park
 
-// Общий кадр исключения (0xC0 байт): x0-x17, x18, x29, x30, ELR_EL1, SPSR_EL1
 .macro SAVE_FRAME
     sub     sp, sp, #0xC0
     stp     x0, x1, [sp, #0x00]
@@ -236,7 +201,6 @@ exc_common:
     eret
 .endm
 
-// IRQ (из EL1 и из EL0)
 irq_entry:
     SAVE_FRAME
     mov     x0, #0
@@ -249,15 +213,13 @@ irq_entry_lower:
     bl      irq_handler
     RESTORE_FRAME
 
-// Синхронное исключение из EL0: x0 = указатель на кадр
 sync_lower_entry:
     SAVE_FRAME
     mov     x0, sp
     bl      sync_lower_handler
     RESTORE_FRAME
 
-// ---- Точка входа вторичного CPU (PSCI CPU_ON) ----
-// x0 = context (номер слота CPU). MMU выключена, IRQ замаскированы.
+// ==== Secondary CPU entry (PSCI CPU_ON) ====
 .section .text, "ax"
 .global secondary_entry
 secondary_entry:
@@ -268,8 +230,8 @@ secondary_entry:
     cmp     x1, #2
     b.ne    1f
 
-    // EL2 -> EL1 (то же, что в основном загрузчике)
-    mov     x2, #(1 << 31)          // HCR_EL2.RW = 1
+    // EL2 -> EL1
+    mov     x2, #(1 << 31)
     msr     hcr_el2, x2
     mrs     x2, cnthctl_el2
     orr     x2, x2, #3
@@ -287,10 +249,10 @@ secondary_entry:
     ubfx    x2, x2, #24, #4
     cbz     x2, 2f
     mov     x2, #0xf
-    msr     S3_4_C12_C9_5, x2       // ICC_SRE_EL2
+    msr     S3_4_C12_C9_5, x2
     isb
 2:
-    mov     x2, #0x3c5               // SPSR_EL2: DAIF masked, EL1h
+    mov     x2, #0x3c5
     msr     spsr_el2, x2
     adr     x2, secondary_el1
     msr     elr_el2, x2
@@ -298,13 +260,11 @@ secondary_entry:
 
 1:
 secondary_el1:
-    // Базовый SCTLR_EL1 (MMU/кэши выключены, RES1 выставлены)
     mov     x0, #0x0800
     movk    x0, #0x30d0, lsl #16
     msr     sctlr_el1, x0
     isb
 
-    // Свой стек: __secondary_stacks + cpu * 32 КиБ
     adrp    x1, __secondary_stacks
     add     x1, x1, :lo12:__secondary_stacks
     mov     x2, #0x8000
@@ -315,7 +275,7 @@ secondary_el1:
     adrp    x0, vectors
     add     x0, x0, :lo12:vectors
     msr     vbar_el1, x0
-    mov     x0, #(3 << 20)           // CPACR_EL1.FPEN
+    mov     x0, #(3 << 20)
     msr     cpacr_el1, x0
     isb
 
@@ -323,10 +283,8 @@ secondary_el1:
     bl      secondary_main
     b       park
 
-// ---- Стеки вторичных ядер: 4 x 32 КиБ ----
 .section .bss
 .balign 16
 .global __secondary_stacks
 __secondary_stacks:
     .space 4 * 0x8000
-
