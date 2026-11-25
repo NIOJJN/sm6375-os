@@ -1,273 +1,626 @@
-//! UFS (Universal Flash Storage) Host Controller для Qualcomm SM6375 (Blair)
+//! UFS Host Controller (UFSHCI 3.x) для Qualcomm SM6375 (Blair).
 //!
-//! Базовый адрес: берётся из DT (обычно 0x4804000)
-//! PHY адрес: 0x4807000
+//! Режимы запуска:
+//! * takeover — загрузчик (ABL/XBL) уже поднял контроллер и линк (HCE=1 и
+//!   HCS.DP=1). PHY, HCE и link startup не трогаем, только ставим свои списки
+//!   запросов. Основной путь для `fastboot boot`.
+//! * full init — HCE-цикл, PHY, DME_LINKSTARTUP. Последовательность PHY НЕ
+//!   проверена (нужны таблицы QMP v4 из Linux phy-qcom-qmp-ufs), на железе
+//!   вероятнее всего не заработает.
 //!
-//! Источник: Linux drivers/scsi/ufs/ufs-qcom.c + JEDEC UFS Specification v3.1
+//! Структуры (UTRD, UPIU, PRDT) собраны по UFSHCI 3.0 и Linux ufshci.h/ufs.h
+//! по памяти. На реальном железе не проверялись.
+//!
+//! Допущения: идентичный маппинг (VA == PA) для статических буферов, ядро
+//! замаплено Normal WB, поэтому вокруг DMA делается `dc civac`.
 
-use crate::platform::{self, Driver, DriverError, PlatformDevice, Resource};
+use crate::platform::{self, Driver, DriverError, PlatformDevice};
 use crate::sync::SpinLock;
-use core::sync::atomic::{AtomicBool, Ordering};
+use crate::timer;
+use core::arch::asm;
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
-/// UFS Host Controller базовый адрес (будет взят из DT)
-static UFS_BASE: SpinLock<Option<usize>> = SpinLock::new(None);
-static UFS_PHY_BASE: SpinLock<Option<usize>> = SpinLock::new(None);
-static UFS_INIT: AtomicBool = AtomicBool::new(false);
+/// Принудительно делать полный init (HCE + PHY + link startup), даже если
+/// загрузчик уже поднял контроллер.
+const FORCE_FULL_INIT: bool = false;
+/// LUN, с которого читаем данные (GPT и т.п.).
+const DEFAULT_LUN: u8 = 0;
+const PHY_BASE_DEFAULT: usize = 0x4807000;
 
-// UFS HC регистры (offset от UFS_BASE)
-mod reg {
-    // Host Controller Standard Registers (UFSHCI v3.0)
-    pub const HCE: usize = 0x34;           // Host Controller Enable
-    pub const UTRIACR: usize = 0x48;       // UTP Transfer Request Interrupt Aggregation Control
-    pub const UTRLBA: usize = 0x50;        // UTP Transfer Request List Base Address L
-    pub const UTRLBAU: usize = 0x54;       // UTP Transfer Request List Base Address U
-    pub const UTRLDBR: usize = 0x58;       // UTP Transfer Request List Doorbell
-    pub const UTRLCLR: usize = 0x5C;       // UTP Transfer Request List Clear
-    pub const UTRLRSR: usize = 0x60;       // UTP Transfer Request List Run Stop
-    pub const UTMRLBA: usize = 0x70;       // UTP Task Management Request List Base Address L
-    pub const UTMRLBAU: usize = 0x74;      // UTP Task Management Request List Base Address U
-    pub const UTMRLDBR: usize = 0x78;      // UTP Task Management Request List Doorbell
-    pub const UTMRLCLR: usize = 0x7C;      // UTP Task Management Request List Clear
-    pub const UTMRLRSR: usize = 0x80;      // UTP Task Management Request List Run Stop
-    pub const UICCMD: usize = 0x90;        // UIC Command
-    pub const UCMDARG1: usize = 0x94;      // UIC Command Argument 1
-    pub const UCMDARG2: usize = 0x98;      // UIC Command Argument 2
-    pub const UCMDARG3: usize = 0x9C;      // UIC Command Argument 3
-    pub const HCS: usize = 0x30;           // Host Controller Status
-    pub const IS: usize = 0x20;            // Interrupt Status
-    pub const IE: usize = 0x24;            // Interrupt Enable
-    
-    // Vendor-specific (Qualcomm)
-    pub const CFG1: usize = 0x104;         // Configuration 1
-    pub const HCLKDIV: usize = 0x108;      // Host Clock Divider
+static HC_BASE: AtomicUsize = AtomicUsize::new(0);
+static PHY_BASE: AtomicUsize = AtomicUsize::new(0);
+static PROBED: AtomicBool = AtomicBool::new(false);
+/// Выставляется только когда контроллер и устройство полностью готовы.
+static READY: AtomicBool = AtomicBool::new(false);
+static BLOCK_SIZE: AtomicU32 = AtomicU32::new(0);
+static CAPACITY_BLOCKS: AtomicU64 = AtomicU64::new(0);
+
+// ---- Регистры HC (UFSHCI) ----
+const REG_IS: usize = 0x20;
+const REG_IE: usize = 0x24;
+const REG_HCS: usize = 0x30;
+const REG_HCE: usize = 0x34;
+const REG_UTRIACR: usize = 0x4C;
+const REG_UTRLBA: usize = 0x50;
+const REG_UTRLBAU: usize = 0x54;
+const REG_UTRLDBR: usize = 0x58;
+const REG_UTRLCLR: usize = 0x5C;
+const REG_UTRLRSR: usize = 0x60;
+const REG_UTMRLBA: usize = 0x70;
+const REG_UTMRLBAU: usize = 0x74;
+const REG_UTMRLRSR: usize = 0x80;
+const REG_UICCMD: usize = 0x90;
+const REG_UCMDARG1: usize = 0x94;
+const REG_UCMDARG2: usize = 0x98;
+const REG_UCMDARG3: usize = 0x9C;
+
+// HCS
+const HCS_DP: u32 = 1 << 0;
+const HCS_UTRLRDY: u32 = 1 << 1;
+const HCS_UTMRLRDY: u32 = 1 << 2;
+const HCS_UCRDY: u32 = 1 << 3;
+
+// IS / IE
+const IS_UTRCS: u32 = 1 << 0;
+const IS_UE: u32 = 1 << 2;
+const IS_ULSS: u32 = 1 << 8;
+const IS_UCCS: u32 = 1 << 10;
+const IS_DFES: u32 = 1 << 11;
+const IS_HCFES: u32 = 1 << 16;
+const IS_SBFES: u32 = 1 << 17;
+const IS_FATAL: u32 = IS_DFES | IS_HCFES | IS_SBFES;
+const IE_MASK: u32 = IS_UTRCS | IS_UE | IS_ULSS | IS_UCCS | IS_FATAL;
+
+const UIC_DME_LINKSTARTUP: u32 = 0x16;
+
+// ---- UTRD / UPIU ----
+const CT_SCSI: u32 = 0;
+const CT_DEV_MANAGE: u32 = 2;
+const UTRD_INTR: u32 = 1 << 24;
+const UTRD_DD_H2D: u32 = 1 << 25;
+const UTRD_DD_D2H: u32 = 1 << 26;
+const OCS_INVALID: u32 = 0x0F;
+
+const UPIU_NOP_OUT: u8 = 0x00;
+const UPIU_COMMAND: u8 = 0x01;
+const UPIU_QUERY_REQ: u8 = 0x16;
+const UPIU_NOP_IN: u8 = 0x20;
+const UPIU_RESPONSE: u8 = 0x21;
+const UPIU_QUERY_RSP: u8 = 0x36;
+
+const QUERY_READ_REQ: u8 = 0x01;
+const QUERY_WRITE_REQ: u8 = 0x81;
+const QUERY_OP_READ_FLAG: u8 = 0x05;
+const QUERY_OP_SET_FLAG: u8 = 0x06;
+const QUERY_IDN_FDEVICEINIT: u8 = 0x01;
+
+const NUM_SLOTS: usize = 32;
+const UCD_CMD_OFF: usize = 0;
+const UCD_RSP_OFF: usize = 512;
+const UCD_RSP_LEN: usize = 512;
+const UCD_PRDT_OFF: usize = 1024;
+const DATA_BUF_SIZE: usize = 16 * 1024;
+
+const SCSI_TIMEOUT_US: u64 = 2_000_000;
+
+/// UTP Transfer Request Descriptor: 8 dword (32 байта).
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct Utrd {
+    dw: [u32; 8],
 }
 
-// UFS PHY регистры (offset от UFS_PHY_BASE)
-mod phy_reg {
-    pub const PHY_START: usize = 0x000;
-    pub const SW_RESET: usize = 0x008;
-    pub const POWER_DOWN_CONTROL: usize = 0x004;
-    pub const PHY_MODE: usize = 0x010;
-    pub const TX_LANE_ENABLE: usize = 0x044;
-    pub const RX_LANE_ENABLE: usize = 0x084;
+/// Запись PRDT: DW0/DW1 — адрес, DW2 — резерв, DW3 — (байт - 1).
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct Prdt {
+    dw: [u32; 4],
 }
 
-// UIC Commands
-const UIC_CMD_DME_GET: u32 = 0x01;
-const UIC_CMD_DME_SET: u32 = 0x02;
-const UIC_CMD_DME_PEER_GET: u32 = 0x03;
-const UIC_CMD_DME_PEER_SET: u32 = 0x04;
-const UIC_CMD_DME_POWERON: u32 = 0x10;
-const UIC_CMD_DME_POWEROFF: u32 = 0x11;
-const UIC_CMD_DME_ENABLE: u32 = 0x12;
-const UIC_CMD_DME_RESET: u32 = 0x14;
-const UIC_CMD_DME_LINKSTARTUP: u32 = 0x16;
+/// UTP Command Descriptor: Command UPIU, Response UPIU, PRDT.
+#[repr(C, align(128))]
+struct Ucd {
+    cmd: [u8; 512],
+    rsp: [u8; 512],
+    prdt: [Prdt; 4],
+}
 
-/// Чтение 32-битного регистра UFS HC
-fn ufs_read(offset: usize) -> u32 {
-    if let Some(base) = *UFS_BASE.lock() {
-        unsafe { core::ptr::read_volatile((base + offset) as *const u32) }
+/// Всё, что видит DMA-движок контроллера.
+#[repr(C, align(4096))]
+struct Dma {
+    utrl: [Utrd; NUM_SLOTS], // 1 КиБ, выравнивание 1 КиБ
+    utmrl: [u8; 1024],       // список task management (не используем)
+    ucd: Ucd,
+    data: [u8; DATA_BUF_SIZE],
+}
+
+const _: () = assert!(core::mem::offset_of!(Dma, utmrl) % 1024 == 0);
+const _: () = assert!(core::mem::offset_of!(Dma, ucd) % 128 == 0);
+const _: () = assert!(core::mem::offset_of!(Dma, data) % 64 == 0);
+const _: () = assert!(core::mem::offset_of!(Ucd, rsp) == UCD_RSP_OFF);
+const _: () = assert!(core::mem::offset_of!(Ucd, prdt) == UCD_PRDT_OFF);
+
+const UTRD_ZERO: Utrd = Utrd { dw: [0; 8] };
+const PRDT_ZERO: Prdt = Prdt { dw: [0; 4] };
+
+static DMA: SpinLock<Dma> = SpinLock::new(Dma {
+    utrl: [UTRD_ZERO; NUM_SLOTS],
+    utmrl: [0; 1024],
+    ucd: Ucd {
+        cmd: [0; 512],
+        rsp: [0; 512],
+        prdt: [PRDT_ZERO; 4],
+    },
+    data: [0; DATA_BUF_SIZE],
+});
+
+#[derive(Clone, Copy, PartialEq)]
+enum Dir {
+    None,
+    In,
+    Out,
+}
+
+// ---- Низкоуровневые помощники ----
+
+fn rd(off: usize) -> u32 {
+    let b = HC_BASE.load(Ordering::Relaxed);
+    if b == 0 {
+        return 0;
+    }
+    unsafe { core::ptr::read_volatile((b + off) as *const u32) }
+}
+
+fn wr(off: usize, val: u32) {
+    let b = HC_BASE.load(Ordering::Relaxed);
+    if b == 0 {
+        return;
+    }
+    unsafe { core::ptr::write_volatile((b + off) as *mut u32, val) }
+}
+
+fn phy_wr(off: usize, val: u32) {
+    let b = PHY_BASE.load(Ordering::Relaxed);
+    if b == 0 {
+        return;
+    }
+    unsafe { core::ptr::write_volatile((b + off) as *mut u32, val) }
+}
+
+fn counter_hz() -> u64 {
+    let f = timer::freq();
+    if f == 0 {
+        19_200_000
     } else {
-        0
+        f
     }
 }
 
-/// Запись 32-битного регистра UFS HC
-fn ufs_write(offset: usize, val: u32) {
-    if let Some(base) = *UFS_BASE.lock() {
-        unsafe { core::ptr::write_volatile((base + offset) as *mut u32, val) }
-    }
-}
-
-/// Чтение 32-битного регистра UFS PHY
-fn phy_read(offset: usize) -> u32 {
-    if let Some(base) = *UFS_PHY_BASE.lock() {
-        unsafe { core::ptr::read_volatile((base + offset) as *const u32) }
-    } else {
-        0
-    }
-}
-
-/// Запись 32-битного регистра UFS PHY
-fn phy_write(offset: usize, val: u32) {
-    if let Some(base) = *UFS_PHY_BASE.lock() {
-        unsafe { core::ptr::write_volatile((base + offset) as *mut u32, val) }
-    }
-}
-
-/// Задержка в микросекундах (примерная)
-fn udelay(us: u32) {
-    for _ in 0..us * 100 {
+/// Задержка по системному счётчику (не по числу итераций цикла).
+fn udelay(us: u64) {
+    let ticks = us * counter_hz() / 1_000_000;
+    let start = timer::counter();
+    while timer::counter().wrapping_sub(start) < ticks {
         core::hint::spin_loop();
     }
 }
 
-/// Инициализация UFS PHY (QMP v4)
-fn ufs_phy_init() -> Result<(), DriverError> {
-    // 1. Сброс PHY
-    phy_write(phy_reg::SW_RESET, 1);
-    udelay(10);
-    phy_write(phy_reg::SW_RESET, 0);
-    udelay(10);
-    
-    // 2. Power up PHY
-    phy_write(phy_reg::POWER_DOWN_CONTROL, 0x0);
-    udelay(10);
-    
-    // 3. Enable TX/RX lanes (обычно lane 0 и 1 для UFS)
-    phy_write(phy_reg::TX_LANE_ENABLE, 0x3); // lane 0,1
-    phy_write(phy_reg::RX_LANE_ENABLE, 0x3);
-    
-    // 4. Set PHY mode to UFS HS-G3 (0x03 = HS-G3, 0x02 = HS-G2, 0x01 = PWM)
-    phy_write(phy_reg::PHY_MODE, 0x02); // HS-G2 для начала
-    
-    // 5. Start PHY
-    phy_write(phy_reg::PHY_START, 0x1);
+/// Опрашивает условие до истечения таймаута (мкс).
+fn wait_for<F: Fn() -> bool>(timeout_us: u64, cond: F) -> bool {
+    let limit = timeout_us * counter_hz() / 1_000_000 + 1;
+    let start = timer::counter();
+    loop {
+        if cond() {
+            return true;
+        }
+        if timer::counter().wrapping_sub(start) > limit {
+            return cond();
+        }
+        core::hint::spin_loop();
+    }
+}
+
+/// Clean+invalidate по VA для DMA-буферов (ядро замаплено Normal WB).
+fn dcache_flush(addr: usize, len: usize) {
+    if len == 0 {
+        return;
+    }
+    let ctr: u64;
+    unsafe { asm!("mrs {}, ctr_el0", out(reg) ctr, options(nomem, nostack, preserves_flags)) };
+    let line = 4usize << ((ctr >> 16) & 0xF);
+    let end = addr + len;
+    let mut p = addr & !(line - 1);
+    unsafe { asm!("dsb sy", options(nostack)) };
+    while p < end {
+        unsafe { asm!("dc civac, {}", in(reg) p, options(nostack)) };
+        p += line;
+    }
+    unsafe { asm!("dsb sy", options(nostack)) };
+}
+
+// ---- UIC ----
+
+fn uic_cmd(cmd: u32, a1: u32, a2: u32, a3: u32) -> Result<u32, DriverError> {
+    // UCRDY = 1 — контроллер готов принять UIC-команду.
+    if !wait_for(1_000_000, || rd(REG_HCS) & HCS_UCRDY != 0) {
+        return Err(DriverError::Busy);
+    }
+    wr(REG_IS, IS_UCCS);
+    wr(REG_UCMDARG1, a1);
+    wr(REG_UCMDARG2, a2);
+    wr(REG_UCMDARG3, a3);
+    wr(REG_UICCMD, cmd);
+    if !wait_for(500_000, || rd(REG_IS) & IS_UCCS != 0) {
+        return Err(DriverError::Timeout);
+    }
+    wr(REG_IS, IS_UCCS);
+    // Код результата — младший байт UCMDARG2, 0 = успех.
+    if rd(REG_UCMDARG2) & 0xFF != 0 {
+        return Err(DriverError::IoError);
+    }
+    Ok(rd(REG_UCMDARG3))
+}
+
+fn link_startup() -> Result<(), DriverError> {
+    for attempt in 0..3 {
+        match uic_cmd(UIC_DME_LINKSTARTUP, 0, 0, 0) {
+            Ok(_) => {
+                wr(REG_IS, IS_ULSS);
+                if rd(REG_HCS) & HCS_DP != 0 {
+                    kprintln!("ufs: link startup complete");
+                    return Ok(());
+                }
+                kprintln!("ufs: link is up but no device present");
+                return Err(DriverError::NotReady);
+            }
+            Err(_) => kprintln!("ufs: link startup attempt {} failed", attempt),
+        }
+    }
+    Err(DriverError::Timeout)
+}
+
+// ---- Инициализация контроллера ----
+
+/// Контроллер уже включён и линк поднят загрузчиком.
+fn hc_is_up() -> bool {
+    rd(REG_HCE) & 1 != 0 && rd(REG_HCS) & HCS_DP != 0
+}
+
+/// Останавливает списки запросов, оставшиеся от загрузчика.
+fn lists_stop() {
+    if !wait_for(100_000, || rd(REG_UTRLDBR) == 0) {
+        kprintln!("ufs: doorbell busy ({:#x}), clearing", rd(REG_UTRLDBR));
+        wr(REG_UTRLCLR, 0); // 0 в бите = очистить слот
+        let _ = wait_for(100_000, || rd(REG_UTRLDBR) == 0);
+    }
+    wr(REG_UTRLRSR, 0);
+    wr(REG_UTMRLRSR, 0);
+}
+
+fn hce_cycle() -> Result<(), DriverError> {
+    wr(REG_HCE, 0);
+    if !wait_for(10_000, || rd(REG_HCE) & 1 == 0) {
+        return Err(DriverError::Timeout);
+    }
+    udelay(1_000);
+    wr(REG_HCE, 1);
     udelay(100);
-    
-    kprintln!("ufs: PHY init done");
+    if !wait_for(50_000, || rd(REG_HCE) & 1 != 0) {
+        return Err(DriverError::Timeout);
+    }
+    wr(REG_IE, IE_MASK);
     Ok(())
 }
 
-/// Отправка UIC команды
-fn ufs_uic_cmd(cmd: u32, arg1: u32, arg2: u32, arg3: u32) -> Result<(), DriverError> {
-    // Ждём пока предыдущая команда завершится
-    for _ in 0..1000 {
-        let hcs = ufs_read(reg::HCS);
-        if (hcs & (1 << 3)) == 0 { // UCRDY bit
-            break;
-        }
-        udelay(10);
+/// ВНИМАНИЕ: последовательность не проверена, реальные таблицы QMP v4 нужно
+/// взять из Linux (phy-qcom-qmp-ufs). Нужна только в режиме full init.
+fn phy_init_unverified() {
+    let b = PHY_BASE.load(Ordering::Relaxed);
+    if b == 0 {
+        return;
     }
-    
-    // Пишем аргументы
-    ufs_write(reg::UCMDARG1, arg1);
-    ufs_write(reg::UCMDARG2, arg2);
-    ufs_write(reg::UCMDARG3, arg3);
-    
-    // Отправляем команду
-    ufs_write(reg::UICCMD, cmd);
-    
-    // Ждём завершения (UCCS bit в IS)
-    for _ in 0..1000 {
-        let is = ufs_read(reg::IS);
-        if (is & (1 << 10)) != 0 { // UCCS bit
-            ufs_write(reg::IS, 1 << 10); // clear
-            return Ok(());
-        }
-        udelay(10);
-    }
-    
-    Err(DriverError::Timeout)
-}
-
-/// Инициализация UFS Host Controller
-fn ufs_hc_init() -> Result<(), DriverError> {
-    // 1. Disable Host Controller
-    ufs_write(reg::HCE, 0);
+    // PHY не входит в ресурс HC (0x4804000 + 0x3000) — маппим явно.
+    crate::mmu::map_device_identity(b & !0xfff, (b & !0xfff) + 0x1000);
+    phy_wr(0x008, 1); // SW_RESET
     udelay(10);
-    
-    // 2. Enable Host Controller
-    ufs_write(reg::HCE, 1);
+    phy_wr(0x008, 0);
+    udelay(10);
+    phy_wr(0x004, 0); // POWER_DOWN_CONTROL
+    udelay(10);
+    phy_wr(0x044, 0x3); // TX_LANE_ENABLE
+    phy_wr(0x084, 0x3); // RX_LANE_ENABLE
+    phy_wr(0x010, 0x02); // PHY_MODE
+    phy_wr(0x000, 0x1); // PHY_START
     udelay(100);
-    
-    // Ждём готовности HCE
-    for _ in 0..1000 {
-        let hce = ufs_read(reg::HCE);
-        if (hce & 1) != 0 {
+    kprintln!("ufs: PHY init done (unverified)");
+}
+
+fn full_init() -> Result<(), DriverError> {
+    phy_init_unverified();
+    hce_cycle()?;
+    kprintln!("ufs: HC enabled");
+    link_startup()
+}
+
+/// Отдаёт контроллеру наши списки запросов и запускает их.
+fn make_operational(d: &Dma) -> Result<(), DriverError> {
+    wr(REG_UTRIACR, 0); // без агрегации прерываний
+    wr(REG_IE, IE_MASK);
+    wr(REG_IS, rd(REG_IS)); // сбросить старые статусы (W1C)
+
+    let utrl = d.utrl.as_ptr() as usize as u64;
+    let utmrl = d.utmrl.as_ptr() as usize as u64;
+    wr(REG_UTRLBA, utrl as u32);
+    wr(REG_UTRLBAU, (utrl >> 32) as u32);
+    wr(REG_UTMRLBA, utmrl as u32);
+    wr(REG_UTMRLBAU, (utmrl >> 32) as u32);
+
+    let both = HCS_UTRLRDY | HCS_UTMRLRDY;
+    if !wait_for(100_000, || (rd(REG_HCS) & both) == both) {
+        kprintln!("ufs: warning: lists not ready, HCS={:#x}", rd(REG_HCS));
+    }
+    wr(REG_UTMRLRSR, 1);
+    wr(REG_UTRLRSR, 1);
+    Ok(())
+}
+
+// ---- Выполнение запросов ----
+
+fn rsp(d: &Dma, i: usize) -> u8 {
+    unsafe { core::ptr::read_volatile(&d.ucd.rsp[i]) }
+}
+
+/// Кладёт запрос в слот 0 и ждёт завершения. Command UPIU (первые 32 байта
+/// `d.ucd.cmd`) и данные для Dir::Out заполняет вызывающий.
+fn exec(
+    d: &mut Dma,
+    cmd_type: u32,
+    dir: Dir,
+    data_len: usize,
+    timeout_us: u64,
+) -> Result<(), DriverError> {
+    if data_len > DATA_BUF_SIZE {
+        return Err(DriverError::InvalidArg);
+    }
+    if dir != Dir::None && (data_len == 0 || data_len % 4 != 0) {
+        return Err(DriverError::InvalidArg);
+    }
+
+    d.ucd.rsp.fill(0);
+    let ucd_pa = &d.ucd as *const Ucd as usize as u64;
+    let data_pa = d.data.as_ptr() as usize as u64;
+
+    let mut dw0 = (cmd_type << 28) | UTRD_INTR;
+    match dir {
+        Dir::In => dw0 |= UTRD_DD_D2H,
+        Dir::Out => dw0 |= UTRD_DD_H2D,
+        Dir::None => {}
+    }
+    let prdt_n: u32 = if dir == Dir::None { 0 } else { 1 };
+    d.utrl[0] = Utrd {
+        dw: [
+            dw0,
+            0,
+            OCS_INVALID,
+            0,
+            ucd_pa as u32,
+            (ucd_pa >> 32) as u32,
+            // DW6: длина ответа (младшие 16) и смещение (старшие 16), в dword
+            (((UCD_RSP_OFF / 4) as u32) << 16) | ((UCD_RSP_LEN / 4) as u32),
+            // DW7: число записей PRDT (младшие 16) и смещение (старшие 16), в dword
+            (((UCD_PRDT_OFF / 4) as u32) << 16) | prdt_n,
+        ],
+    };
+    if dir != Dir::None {
+        d.ucd.prdt[0] = Prdt {
+            dw: [data_pa as u32, (data_pa >> 32) as u32, 0, (data_len as u32) - 1],
+        };
+    }
+
+    dcache_flush(d.utrl.as_ptr() as usize, core::mem::size_of::<[Utrd; NUM_SLOTS]>());
+    dcache_flush(&d.ucd as *const Ucd as usize, core::mem::size_of::<Ucd>());
+    if dir != Dir::None {
+        dcache_flush(data_pa as usize, data_len);
+    }
+
+    wr(REG_IS, IS_UTRCS);
+    wr(REG_UTRLDBR, 1);
+    if !wait_for(timeout_us, || rd(REG_UTRLDBR) & 1 == 0) {
+        wr(REG_UTRLCLR, !1u32); // 0 в бите 0 = очистить слот 0
+        return Err(DriverError::Timeout);
+    }
+
+    let is_val = rd(REG_IS);
+    wr(REG_IS, is_val & IS_UTRCS);
+    if is_val & IS_FATAL != 0 {
+        kprintln!("ufs: fatal error, IS={:#x}", is_val);
+        return Err(DriverError::IoError);
+    }
+
+    // Забрать то, что записал контроллер.
+    dcache_flush(d.utrl.as_ptr() as usize, core::mem::size_of::<[Utrd; NUM_SLOTS]>());
+    dcache_flush(&d.ucd.rsp as *const [u8; 512] as usize, UCD_RSP_LEN);
+    if dir == Dir::In {
+        dcache_flush(data_pa as usize, data_len);
+    }
+    let ocs = unsafe { core::ptr::read_volatile(&d.utrl[0].dw[2]) } & 0xFF;
+    if ocs != 0 {
+        kprintln!("ufs: request failed, OCS={:#x}", ocs);
+        return Err(DriverError::IoError);
+    }
+    Ok(())
+}
+
+/// SCSI-команда. Возвращает SCSI status (0 = GOOD, 2 = CHECK CONDITION).
+fn scsi_cmd(d: &mut Dma, lun: u8, cdb: &[u8], dir: Dir, data_len: usize) -> Result<u8, DriverError> {
+    if cdb.is_empty() || cdb.len() > 16 {
+        return Err(DriverError::InvalidArg);
+    }
+    d.ucd.cmd[UCD_CMD_OFF..UCD_CMD_OFF + 32].fill(0);
+    d.ucd.cmd[0] = UPIU_COMMAND;
+    d.ucd.cmd[1] = match dir {
+        Dir::In => 0x40,  // READ
+        Dir::Out => 0x20, // WRITE
+        Dir::None => 0x00,
+    };
+    d.ucd.cmd[2] = lun;
+    d.ucd.cmd[3] = 0; // task tag = слот 0
+    d.ucd.cmd[12..16].copy_from_slice(&(data_len as u32).to_be_bytes());
+    d.ucd.cmd[16..16 + cdb.len()].copy_from_slice(cdb);
+
+    exec(d, CT_SCSI, dir, data_len, SCSI_TIMEOUT_US)?;
+
+    if rsp(d, 0) & 0x3F != UPIU_RESPONSE || rsp(d, 6) != 0 {
+        return Err(DriverError::IoError);
+    }
+    Ok(rsp(d, 7))
+}
+
+fn nop_out(d: &mut Dma) -> Result<(), DriverError> {
+    d.ucd.cmd[UCD_CMD_OFF..UCD_CMD_OFF + 32].fill(0);
+    d.ucd.cmd[0] = UPIU_NOP_OUT;
+    exec(d, CT_DEV_MANAGE, Dir::None, 0, 100_000)?;
+    if rsp(d, 0) & 0x3F != UPIU_NOP_IN {
+        return Err(DriverError::IoError);
+    }
+    Ok(())
+}
+
+/// Query: READ_FLAG / SET_FLAG. Возвращает значение флага.
+fn query_flag(d: &mut Dma, func: u8, opcode: u8, idn: u8) -> Result<u8, DriverError> {
+    d.ucd.cmd[UCD_CMD_OFF..UCD_CMD_OFF + 32].fill(0);
+    d.ucd.cmd[0] = UPIU_QUERY_REQ;
+    d.ucd.cmd[5] = func;
+    d.ucd.cmd[12] = opcode;
+    d.ucd.cmd[13] = idn;
+    exec(d, CT_DEV_MANAGE, Dir::None, 0, 1_500_000)?;
+    if rsp(d, 0) & 0x3F != UPIU_QUERY_RSP || rsp(d, 6) != 0 {
+        return Err(DriverError::IoError);
+    }
+    Ok(rsp(d, 23) & 1)
+}
+
+/// NOP OUT, затем fDeviceInit (как ufshcd_complete_dev_init в Linux).
+fn dev_init(d: &mut Dma) -> Result<(), DriverError> {
+    let mut ok = false;
+    for _ in 0..10 {
+        if nop_out(d).is_ok() {
+            ok = true;
             break;
         }
-        udelay(10);
+        udelay(10_000);
     }
-    
-    kprintln!("ufs: HC enabled");
-    
-    // 3. Configure interrupt aggregation (disable для простоты)
-    ufs_write(reg::UTRIACR, 0);
-    
-    // 4. Enable interrupts
-    ufs_write(reg::IE, 0xFFFF_FFFF); // enable all
-    
-    // 5. DME_RESET
-    ufs_uic_cmd(UIC_CMD_DME_RESET, 0, 0, 0)?;
-    udelay(100);
-    
-    // 6. DME_ENABLE
-    ufs_uic_cmd(UIC_CMD_DME_ENABLE, 0, 0, 0)?;
-    udelay(100);
-    
-    // 7. DME_LINKSTARTUP
-    kprintln!("ufs: starting link...");
-    ufs_uic_cmd(UIC_CMD_DME_LINKSTARTUP, 0, 0, 0)?;
-    
-    // Ждём ULSS (UIC Link Startup Status) в IS
-    for _ in 0..5000 {
-        let is = ufs_read(reg::IS);
-        if (is & (1 << 8)) != 0 { // ULSS bit
-            ufs_write(reg::IS, 1 << 8); // clear
-            kprintln!("ufs: link startup complete");
+    if !ok {
+        kprintln!("ufs: NOP OUT failed");
+        return Err(DriverError::Timeout);
+    }
+    query_flag(d, QUERY_WRITE_REQ, QUERY_OP_SET_FLAG, QUERY_IDN_FDEVICEINIT)?;
+    for _ in 0..300 {
+        if query_flag(d, QUERY_READ_REQ, QUERY_OP_READ_FLAG, QUERY_IDN_FDEVICEINIT)? == 0 {
             return Ok(());
         }
-        udelay(100);
+        udelay(5_000);
     }
-    
+    kprintln!("ufs: fDeviceInit did not clear");
     Err(DriverError::Timeout)
 }
 
-/// Probe UFS драйвера
+/// TEST UNIT READY с повторами (первый ответ может быть UNIT ATTENTION).
+fn unit_ready(d: &mut Dma, lun: u8) -> bool {
+    for _ in 0..10 {
+        if let Ok(0) = scsi_cmd(d, lun, &[0u8; 6], Dir::None, 0) {
+            return true;
+        }
+        udelay(20_000);
+    }
+    false
+}
+
+/// READ CAPACITY(10): (число блоков, размер блока).
+fn read_capacity(d: &mut Dma, lun: u8) -> Result<(u64, u32), DriverError> {
+    let cdb = [0x25u8, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+    if scsi_cmd(d, lun, &cdb, Dir::In, 8)? != 0 {
+        return Err(DriverError::IoError);
+    }
+    let last = u32::from_be_bytes([d.data[0], d.data[1], d.data[2], d.data[3]]);
+    let bs = u32::from_be_bytes([d.data[4], d.data[5], d.data[6], d.data[7]]);
+    if bs == 0 || last == u32::MAX {
+        return Err(DriverError::NotSupported);
+    }
+    Ok((last as u64 + 1, bs))
+}
+
+// ---- Probe ----
+
 fn ufs_probe(dev: &PlatformDevice) -> Result<(), DriverError> {
-    if UFS_INIT.swap(true, Ordering::AcqRel) {
+    if PROBED.swap(true, Ordering::AcqRel) {
         return Err(DriverError::AlreadyExists);
     }
-    
-    // Получаем адреса из DT
+
     let (hc_base, hc_size) = dev.get_resource_mem(0).ok_or(DriverError::NoMemory)?;
-    *UFS_BASE.lock() = Some(hc_base);
-    
-    kprintln!("ufs: HC mapped at {:#x}, size={:#x}", hc_base, hc_size);
-    
-    // PHY адрес обычно идёт вторым resource или отдельным узлом
-    // Для SM6375: PHY @ 0x4807000
-    // TODO: получить из отдельного узла "ufsphy_mem"
-    *UFS_PHY_BASE.lock() = Some(0x4807000);
-    kprintln!("ufs: PHY at {:#x}", 0x4807000);
-    
-    // Включаем clocks через GCC
-    if let Some(clk_id) = dev.get_resource_clock("core") {
-        crate::drivers::gcc_sm6375::clk_enable_by_id(clk_id as u32)?;
+    HC_BASE.store(hc_base, Ordering::Release);
+    let phy = dev
+        .get_resource_mem(1)
+        .map(|(b, _)| b)
+        .unwrap_or(PHY_BASE_DEFAULT);
+    PHY_BASE.store(phy, Ordering::Release);
+    kprintln!("ufs: HC at {:#x}, size={:#x}, PHY at {:#x}", hc_base, hc_size, phy);
+
+    // Такты: ошибки не фатальны — загрузчик мог уже всё включить.
+    for name in ["core", "bus", "phy"] {
+        if let Some(id) = dev.get_resource_clock(name) {
+            if crate::drivers::gcc_sm6375::clk_enable_by_id(id as u32).is_err() {
+                kprintln!("ufs: clock '{}' enable failed", name);
+            }
+        }
     }
-    if let Some(clk_id) = dev.get_resource_clock("bus") {
-        crate::drivers::gcc_sm6375::clk_enable_by_id(clk_id as u32)?;
+    if crate::drivers::clock_verify::verify_clock_tree().is_err() {
+        kprintln!("ufs: clock tree verify failed");
     }
-    if let Some(clk_id) = dev.get_resource_clock("phy") {
-        crate::drivers::gcc_sm6375::clk_enable_by_id(clk_id as u32)?;
-    }
-    
-    // Проверяем и включаем все критические такты через clock_verify
-    crate::drivers::clock_verify::verify_clock_tree()?;
-    
-    // Инициализация PHY
+
     crate::drivers::vibro::indicate(crate::drivers::vibro::BootStage::UfsInit);
-    ufs_phy_init()?;
-    
-    // Запрашиваем SMMU bypass для нашего SID (0x60 = 96)
-    // Это должно произойти ДО HC init, иначе DMA упадёт
+
+    // SMMU bypass для нашего SID — до любых DMA-запросов.
     if let Some(sid) = dev.get_resource_sid() {
-        crate::drivers::smmu::smmu_request_bypass(sid);
+        let _ = crate::drivers::smmu::smmu_request_bypass(sid);
     }
-    
-    // Инициализация Host Controller
-    ufs_hc_init()?;
-    
+
+    let takeover = !FORCE_FULL_INIT && hc_is_up();
+    if takeover {
+        kprintln!("ufs: HC already up (HCE=1, DP=1), taking over");
+        lists_stop();
+    } else {
+        kprintln!("ufs: full HC init");
+        full_init()?;
+    }
+
+    {
+        let mut guard = DMA.lock();
+        let d: &mut Dma = &mut *guard;
+        make_operational(d)?;
+
+        // При takeover устройство обычно уже инициализировано загрузчиком.
+        let skip_dev_init = takeover && unit_ready(d, DEFAULT_LUN);
+        if !skip_dev_init {
+            dev_init(d)?;
+            if !unit_ready(d, DEFAULT_LUN) {
+                kprintln!("ufs: LUN {} not ready", DEFAULT_LUN);
+                return Err(DriverError::NotReady);
+            }
+        }
+
+        let (blocks, bs) = read_capacity(d, DEFAULT_LUN)?;
+        BLOCK_SIZE.store(bs, Ordering::Release);
+        CAPACITY_BLOCKS.store(blocks, Ordering::Release);
+        READY.store(true, Ordering::Release);
+        kprintln!("ufs: LUN {}: {} blocks x {} bytes", DEFAULT_LUN, blocks, bs);
+    } // лок DMA отпущен: gpt_init читает через ufs_read_sectors
+
     kprintln!("ufs: probe ok");
-    
-    // Инициализируем GPT parser для поиска ESP
     let _ = crate::drivers::gpt::gpt_init();
-    
     Ok(())
 }
 
-/// UFS драйвер
 static UFS_DRIVER: Driver = Driver {
     name: "ufs-qcom",
     compatible: ["qcom,ufshc", "qcom,ufs-qcom", "", "", "", "", "", ""],
@@ -282,296 +635,61 @@ static UFS_DRIVER_REG: fn() = || {
     let _ = platform::driver_register(&UFS_DRIVER);
 };
 
-// ========== Block Device API ==========
+// ---- Block device API ----
 
-/// UTP Transfer Request Descriptor (UTRD)
-#[repr(C, align(1024))]
-struct Utrd {
-    // DW0-3: Command Descriptor Base Address
-    ucdba: u64,         // UCD base address (lower 7 bits = 0)
-    ucdba_upper: u32,   // upper 32 bits (reserved in 32-bit)
-    _rsv0: u32,
-    // DW4-5: Response UPIU offset/length
-    response_upiu_offset: u16,
-    response_upiu_length: u16,
-    prdt_offset: u16,
-    prdt_length: u16,
-    // DW6-7: Status
-    overall_cmd_status: u8,
-    _rsv1: [u8; 7],
+/// Размер логического блока LUN 0 в байтах (обычно 4096); 0, если UFS не готов.
+pub fn ufs_block_size() -> usize {
+    BLOCK_SIZE.load(Ordering::Acquire) as usize
 }
 
-/// UTP Command Descriptor (UCD)
-#[repr(C, align(128))]
-struct Ucd {
-    // Command UPIU
-    cmd_upiu: [u8; 32],
-    // Response UPIU
-    response_upiu: [u8; 32],
-    // PRDT (Physical Region Description Table)
-    prdt: [Prdt; 1],
-}
-
-/// Physical Region Description Table Entry
-#[repr(C)]
-struct Prdt {
-    base_addr: u64,
-    _rsv: u32,
-    data_byte_count: u32, // bits [0:17] = byte count - 1
-}
-
-/// SCSI READ(10) Command Descriptor Block
-#[repr(C)]
-struct ScsiRead10Cdb {
-    opcode: u8,          // 0x28
-    flags: u8,
-    lba: [u8; 4],        // big-endian LBA
-    group: u8,
-    transfer_len: [u8; 2], // big-endian sector count
-    control: u8,
-}
-
-/// Direction для SCSI команды
-#[derive(PartialEq)]
-enum ScsiDir {
-    None,
-    In,
-    Out,
-}
-
-/// Общий SCSI команда через UFS
-/// cdb: Command Descriptor Block (до 16 байт)
-/// dir: направление данных
-/// buf: буфер для данных (In/Out)
-/// expected_len: ожидаемая длина данных
-fn ufs_scsi_cmd_raw(cdb: &[u8], dir: ScsiDir, buf: &mut [u8], expected_len: usize) -> Result<usize, DriverError> {
-    if !UFS_INIT.load(Ordering::Acquire) {
-        return Err(DriverError::NotReady);
-    }
-    if cdb.len() > 16 {
-        return Err(DriverError::InvalidArg);
-    }
-    if (dir == ScsiDir::In || dir == ScsiDir::Out) && buf.len() < expected_len {
-        return Err(DriverError::InvalidArg);
-    }
-
-    let mut utrd = UFS_UTRD.lock();
-    let mut ucd = UFS_UCD.lock();
-    let mut read_buf = UFS_READ_BUF.lock();
-
-    // UTRD: указываем на UCD
-    let ucd_addr = &*ucd as *const Ucd as u64;
-    utrd.ucdba = ucd_addr;
-    utrd.ucdba_upper = 0;
-    utrd.response_upiu_offset = 32;
-    utrd.response_upiu_length = 32;
-    utrd.prdt_offset = 64;
-    utrd.prdt_length = if dir == ScsiDir::None { 0 } else { 1 };
-    utrd.overall_cmd_status = 0;
-
-    // PRDT для data-in/out
-    if dir != ScsiDir::None {
-        let buf_addr = read_buf.as_ptr() as u64;
-        ucd.prdt[0].base_addr = buf_addr;
-        ucd.prdt[0].data_byte_count = ((expected_len as u32) - 1) & 0x3FFFF;
-    }
-
-    // Command UPIU
-    ucd.cmd_upiu[0] = 0x01; // Transaction Type = Command
-    ucd.cmd_upiu[1] = 0x00; // Flags
-    ucd.cmd_upiu[2] = 0x00; // LUN
-    ucd.cmd_upiu[3] = 0x00; // Task Tag
-    ucd.cmd_upiu[4] = 0x00; // Command Set Type = SCSI
-    ucd.cmd_upiu[5] = 0x00; // Reserved
-    ucd.cmd_upiu[6] = 0x00; // Reserved
-    ucd.cmd_upiu[7] = 0x00; // Reserved
-    ucd.cmd_upiu[8] = 0x00; // EHS Length
-    ucd.cmd_upiu[9] = 0x00; // Reserved
-    // Data Segment Length (big-endian, 2 байта)
-    let data_len = expected_len as u16;
-    ucd.cmd_upiu[10] = (data_len >> 8) as u8;
-    ucd.cmd_upiu[11] = data_len as u8;
-    // CDB (bytes 12..)
-    let cdb_len = cdb.len().min(16);
-    ucd.cmd_upiu[12..12+cdb_len].copy_from_slice(&cdb[..cdb_len]);
-
-    // Настраиваем Transfer Request List
-    let utrd_addr = &*utrd as *const Utrd as u64;
-    ufs_write(reg::UTRLBA, (utrd_addr & 0xFFFFFFFF) as u32);
-    ufs_write(reg::UTRLBAU, (utrd_addr >> 32) as u32);
-
-    // Start Transfer Request List
-    ufs_write(reg::UTRLRSR, 1);
-
-    // Ring doorbell для slot 0
-    ufs_write(reg::UTRLDBR, 1 << 0);
-
-    // Ждём завершения (UTRCS bit в IS)
-    for _ in 0..10000 {
-        let is = ufs_read(reg::IS);
-        if (is & (1 << 0)) != 0 { // UTRCS bit
-            ufs_write(reg::IS, 1 << 0); // clear
-            
-            // Проверяем статус
-            if utrd.overall_cmd_status == 0 {
-                // Success: копируем данные для In
-                if dir == ScsiDir::In {
-                    buf[..expected_len].copy_from_slice(&read_buf[..expected_len]);
-                }
-                return Ok(expected_len);
-            } else {
-                return Err(DriverError::IoError);
-            }
-        }
-        udelay(10);
-    }
-
-    Err(DriverError::Timeout)
-}
-
-/// Обёртка для простых команд без данных (TEST UNIT READY, etc.)
-fn ufs_scsi_simple(opcode: u8) -> Result<(), DriverError> {
-    ufs_scsi_cmd_raw(&[opcode], ScsiDir::None, &mut [], 0).map(|_| ())
-}
-
-/// Buffer для чтения секторов (4KB aligned)
-static UFS_READ_BUF: SpinLock<[u8; 8192]> = SpinLock::new([0u8; 8192]);
-static UFS_UTRD: SpinLock<Utrd> = SpinLock::new(Utrd {
-    ucdba: 0,
-    ucdba_upper: 0,
-    _rsv0: 0,
-    response_upiu_offset: 32,
-    response_upiu_length: 32,
-    prdt_offset: 64,
-    prdt_length: 1,
-    overall_cmd_status: 0,
-    _rsv1: [0; 7],
-});
-static UFS_UCD: SpinLock<Ucd> = SpinLock::new(Ucd {
-    cmd_upiu: [0; 32],
-    response_upiu: [0; 32],
-    prdt: [Prdt {
-        base_addr: 0,
-        _rsv: 0,
-        data_byte_count: 0,
-    }],
-});
-
-/// Чтение секторов с UFS (LBA, sector_count)
-pub fn ufs_read_sectors(lba: u64, count: u16, buf: &mut [u8]) -> Result<usize, DriverError> {
-    if !UFS_INIT.load(Ordering::Acquire) {
-        return Err(DriverError::NotReady);
-    }
-    
-    if buf.len() < (count as usize * 512) {
-        return Err(DriverError::InvalidArg);
-    }
-    
-    // Настраиваем UTRD
-    let mut utrd = UFS_UTRD.lock();
-    let mut ucd = UFS_UCD.lock();
-    let mut read_buf = UFS_READ_BUF.lock();
-    
-    // UTRD: указываем на UCD
-    let ucd_addr = &*ucd as *const Ucd as u64;
-    utrd.ucdba = ucd_addr;
-    utrd.ucdba_upper = 0;
-    utrd.response_upiu_offset = 32;
-    utrd.response_upiu_length = 32;
-    utrd.prdt_offset = 64;
-    utrd.prdt_length = 1;
-    utrd.overall_cmd_status = 0;
-    
-    // PRDT: физический адрес буфера
-    let buf_addr = read_buf.as_ptr() as u64;
-    ucd.prdt[0].base_addr = buf_addr;
-    ucd.prdt[0].data_byte_count = ((count as u32 * 512) - 1) & 0x3FFFF;
-    
-    // Строим SCSI READ(10) CDB
-    let cdb = ScsiRead10Cdb {
-        opcode: 0x28,
-        flags: 0,
-        lba: [
-            (lba >> 24) as u8,
-            (lba >> 16) as u8,
-            (lba >> 8) as u8,
-            lba as u8,
-        ],
-        group: 0,
-        transfer_len: [(count >> 8) as u8, count as u8],
-        control: 0,
-    };
-    
-    // Command UPIU: заголовок + CDB
-    ucd.cmd_upiu[0] = 0x01; // Transaction Type = Command
-    ucd.cmd_upiu[1] = 0x00; // Flags
-    ucd.cmd_upiu[2] = 0x00; // LUN
-    ucd.cmd_upiu[3] = 0x00; // Task Tag
-    ucd.cmd_upiu[4] = 0x00; // Command Set Type = SCSI
-    ucd.cmd_upiu[5] = 0x00; // Reserved
-    ucd.cmd_upiu[6] = 0x00; // Reserved
-    ucd.cmd_upiu[7] = 0x00; // Reserved
-    ucd.cmd_upiu[8] = 0x00; // EHS Length
-    ucd.cmd_upiu[9] = 0x00; // Reserved
-    ucd.cmd_upiu[10] = 0x00; // Data Segment Length (MSB)
-    ucd.cmd_upiu[11] = 0x00; // Data Segment Length (LSB)
-    ucd.cmd_upiu[12..22].copy_from_slice(unsafe {
-        core::slice::from_raw_parts(&cdb as *const ScsiRead10Cdb as *const u8, 10)
-    });
-    
-    // Настраиваем Transfer Request List
-    let utrd_addr = &*utrd as *const Utrd as u64;
-    ufs_write(reg::UTRLBA, (utrd_addr & 0xFFFFFFFF) as u32);
-    ufs_write(reg::UTRLBAU, (utrd_addr >> 32) as u32);
-    
-    // Start Transfer Request List
-    ufs_write(reg::UTRLRSR, 1);
-    
-    // Ring doorbell для slot 0
-    ufs_write(reg::UTRLDBR, 1 << 0);
-    
-    // Ждём завершения (UTRCS bit в IS)
-    for _ in 0..10000 {
-        let is = ufs_read(reg::IS);
-        if (is & (1 << 0)) != 0 { // UTRCS bit
-            ufs_write(reg::IS, 1 << 0); // clear
-            
-            // Проверяем статус
-            if utrd.overall_cmd_status == 0 {
-                // Success: копируем данные
-                buf[0..(count as usize * 512)].copy_from_slice(&read_buf[0..(count as usize * 512)]);
-                return Ok(count as usize * 512);
-            } else {
-                return Err(DriverError::IoError);
-            }
-        }
-        udelay(10);
-    }
-    
-    Err(DriverError::Timeout)
-}
-
-/// Получить размер UFS устройства (в секторах)
+/// Ёмкость LUN 0 в логических блоках.
 pub fn ufs_get_capacity() -> Result<u64, DriverError> {
-    if !UFS_INIT.load(Ordering::Acquire) {
+    if !READY.load(Ordering::Acquire) {
         return Err(DriverError::NotReady);
     }
-    
-    // SCSI READ CAPACITY(10) - opcode 0x25
-    // CDB: [0x25, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]
-    // PMI=0 (byte 1 bit 0) = return last LBA
-    // LBA=0 (bytes 2-5)
-    let mut resp = [0u8; 8];
-    ufs_scsi_cmd_raw(&[0x25, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00], 
-                     ScsiDir::In, &mut resp, 8)?;
-    
-    let last_lba = u32::from_be_bytes([resp[0], resp[1], resp[2], resp[3]]);
-    let block_size = u32::from_be_bytes([resp[4], resp[5], resp[6], resp[7]]);
-    
-    if block_size != 512 {
-        kprintln!("ufs: unexpected block size {}", block_size);
+    Ok(CAPACITY_BLOCKS.load(Ordering::Acquire))
+}
+
+/// Читает `count` логических блоков LUN 0 начиная с `lba`. Размер блока — см.
+/// `ufs_block_size()` (на UFS обычно 4096, а не 512). `buf` должен вмещать
+/// `count * block_size` байт.
+pub fn ufs_read_sectors(lba: u64, count: u16, buf: &mut [u8]) -> Result<usize, DriverError> {
+    if !READY.load(Ordering::Acquire) {
+        return Err(DriverError::NotReady);
     }
-    
-    // Capacity in sectors = last LBA + 1
-    Ok((last_lba as u64) + 1)
+    let bs = ufs_block_size();
+    if bs == 0 || count == 0 {
+        return Err(DriverError::InvalidArg);
+    }
+    let max_blocks = DATA_BUF_SIZE / bs;
+    if max_blocks == 0 {
+        return Err(DriverError::NotSupported);
+    }
+    let total = count as usize * bs;
+    if buf.len() < total {
+        return Err(DriverError::InvalidArg);
+    }
+    let end = lba.checked_add(count as u64).ok_or(DriverError::InvalidArg)?;
+    if end > CAPACITY_BLOCKS.load(Ordering::Acquire) {
+        return Err(DriverError::InvalidArg);
+    }
+
+    let mut guard = DMA.lock();
+    let d: &mut Dma = &mut *guard;
+    let mut done = 0usize;
+    while done < count as usize {
+        let n = core::cmp::min(count as usize - done, max_blocks);
+        let cur = lba + done as u64; // < end <= 2^32, влезает в u32
+        let mut cdb = [0u8; 10];
+        cdb[0] = 0x28; // READ(10)
+        cdb[2..6].copy_from_slice(&(cur as u32).to_be_bytes());
+        cdb[7..9].copy_from_slice(&(n as u16).to_be_bytes());
+        let len = n * bs;
+        if scsi_cmd(d, DEFAULT_LUN, &cdb, Dir::In, len)? != 0 {
+            return Err(DriverError::IoError);
+        }
+        buf[done * bs..done * bs + len].copy_from_slice(&d.data[..len]);
+        done += n;
+    }
+    Ok(total)
 }
