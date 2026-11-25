@@ -34,9 +34,14 @@ run-dtb: build initramfs
 > qemu-system-aarch64 -machine virt,gic-version=3 -cpu max -m 512M -smp 4 -serial stdio -initrd $(INITRD) -kernel $(BIN) -dtb fake_sm6375.dtb
 
 # boot.img v4 для `fastboot boot boot.img` (разовая загрузка без прошивки).
-# DTB при v3/v4 берётся из vendor_boot-раздела телефона (там консольный
-# GENI UART уже status="ok"), поэтому в boot.img нужен только kernel+ramdisk.
+# Poco X4 Pro (SM6375/Blair) параметры:
+#   base: 0x40000000
+#   page_size: 4096
+#   kernel_offset: 0x80000
+#   tags_offset: 0x01E00000
+#   header_version: 4
+# DTB берётся из vendor_boot (нужен наш пропатченный vendor_boot_patched.img).
 bootimg: build initramfs
-> mkbootimg --header_version 4 --kernel $(BIN) --ramdisk $(INITRD) --os_version 14.0.0 --os_patch_level 2026-11 -o boot.img
+> mkbootimg --header_version 4 --kernel $(BIN) --ramdisk $(INITRD) --base 0x40000000 --pagesize 4096 --kernel_offset 0x80000 --tags_offset 0x01E00000 --os_version 14.0.0 --os_patch_level 2026-11 -o boot.img
 
 .PHONY: build initramfs run run-el2 bootimg

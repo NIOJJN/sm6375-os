@@ -19,10 +19,20 @@ _real_start:
     mov     x19, x0                 // x19 = указатель на DTB (callee-saved, переживает eret)
     msr     daifset, #0xf           // маскируем D, A, I, F
 
+    // STAGE 0: Boot CPU detected
+    mov     x0, #0x40000000         // Known address for stage marker
+    mov     x1, #0x1
+    str     x1, [x0]
+
     // Работаем только на загрузочном ядре (Aff2:Aff0 == 0), остальные паркуем.
     mrs     x1, mpidr_el1
     and     x1, x1, #0xffffff
     cbnz    x1, park
+
+    // STAGE 1: Primary CPU confirmed
+    mov     x0, #0x40000000
+    mov     x1, #0x2
+    str     x1, [x0]
 
     mrs     x0, CurrentEL
     lsr     x0, x0, #2
@@ -34,6 +44,11 @@ _real_start:
 
 // ---- EL2 -> EL1 ----
 el2_entry:
+    // STAGE 2: EL2 entry
+    mov     x0, #0x40000000
+    mov     x1, #0x3
+    str     x1, [x0]
+
     mov     x0, #(1 << 31)          // HCR_EL2.RW = 1: EL1 работает в AArch64
     msr     hcr_el2, x0
 
@@ -68,6 +83,11 @@ el2_entry:
 
 // ---- EL1 ----
 el1_entry:
+    // STAGE 3: EL1 entry
+    mov     x0, #0x40000000
+    mov     x1, #0x4
+    str     x1, [x0]
+
     // SCTLR_EL1: MMU, кэши, выравнивание-проверки выключены (только RES1 биты)
     mov     x0, #0x0800
     movk    x0, #0x30d0, lsl #16
@@ -86,6 +106,11 @@ el1_entry:
     msr     cpacr_el1, x0
     isb
 
+    // STAGE 4: Before bss clear
+    mov     x0, #0x40000000
+    mov     x1, #0x5
+    str     x1, [x0]
+
     // Очистка .bss
     adrp    x0, __bss_start
     add     x0, x0, :lo12:__bss_start
@@ -97,6 +122,12 @@ el1_entry:
     stp     xzr, xzr, [x0], #16
     b       2b
 3:
+
+    // STAGE 6: Before kernel_main
+    mov     x0, #0x40000000
+    mov     x1, #0x6
+    str     x1, [x0]
+
     mov     x0, x19                 // аргумент: указатель на DTB
     bl      kernel_main
 park:
@@ -151,6 +182,13 @@ vectors:
     ventry  15
 
 exc_common:
+    // CRASH SIGNATURE: write pattern before Rust handler
+    mov     x0, #0x40000000
+    mov     x1, #0xDEAD
+    str     x1, [x0]
+    mov     x1, #0xBEEF
+    str     x1, [x0, #8]
+
     mrs     x1, esr_el1
     mrs     x2, elr_el1
     mrs     x3, far_el1
