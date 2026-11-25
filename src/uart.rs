@@ -18,6 +18,10 @@ impl Pl011 {
         Self { base }
     }
 
+    pub fn base(&self) -> usize {
+        self.base
+    }
+
     unsafe fn w(&self, off: usize, v: u32) {
         write_volatile((self.base + off) as *mut u32, v);
     }

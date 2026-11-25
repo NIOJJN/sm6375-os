@@ -335,29 +335,6 @@ pub extern "C" fn exception_handler(idx: u64, esr: u64, elr: u64, far: u64, lr: 
         } else { 0 };
         kprintln!("  [sp+{:#x}] = {:#x}", i * 8, val);
     }
-    let va_page = sp & !0xfff;
-    if let Some((root, _asid)) = proc::root_of(pid) {
-        let pa_page = unsafe {
-            let l0 = root as *const u64;
-            let e0 = l0.add((va_page >> 39) & 0x1ff).read();
-            let l1 = (e0 & 0x0000_FFFF_FFFF_F000u64) as *const u64;
-            let e1 = l1.add((va_page >> 30) & 0x1ff).read();
-            let l2 = (e1 & 0x0000_FFFF_FFFF_F000u64) as *const u64;
-            let e2 = l2.add((va_page >> 21) & 0x1ff).read();
-            let l3 = (e2 & 0x0000_FFFF_FFFF_F000u64) as *const u64;
-            let e3 = l3.add((va_page >> 12) & 0x1ff).read();
-            (e3 & 0x0000_FFFF_FFFF_F000u64) as usize
-        };
-        for off in [0usize, 0x100, 0x800, 0xd50, 0xfd0].iter() {
-            let v = unsafe { core::ptr::read_volatile((pa_page + off) as *const u64) };
-            kprintln!("  [pa+{:#x}] = {:#x}", off, v);
-        }
-    }
-    for page in [0x4052f000usize, 0x40530000, 0x40531000, 0x4053e000] {
-        let v0 = unsafe { core::ptr::read_volatile(page as *const u64) };
-        let v1 = unsafe { core::ptr::read_volatile((page + 0xff8) as *const u64) };
-        kprintln!("  [pg {:#x}] {:#x} {:#x}", page, v0, v1);
-    }
     if let Some((root, asid)) = proc::root_of(pid) {
         let va = sp & !0xfff;
         kprintln!("  root={:#x} asid={} va={:#x}", root, asid, va);
@@ -390,11 +367,10 @@ pub extern "C" fn exception_handler(idx: u64, esr: u64, elr: u64, far: u64, lr: 
 
 #[panic_handler]
 fn panic(info: &PanicInfo) -> ! {
-    unsafe {
-        let uart = 0x0900_0000usize as *mut u32;
-        for b in b"PANIC!\n" { core::ptr::write_volatile(uart, *b as u32); }
+    console::emergency_write(b"\nPANIC!\n");
+    // kprintln! берёт лок консоли: если паника случилась под ним — не виснем.
+    if console::console_free() {
+        kprintln!("PANIC: {}", info);
     }
-    // try to print details without locking console
-    kprintln!("PANIC: {}", info);
     halt()
 }

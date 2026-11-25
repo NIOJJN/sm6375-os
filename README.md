@@ -37,7 +37,11 @@ LOAD_BASE=0x... make build   # должен быть кратен 2 MiB и ра�
 
 # UFS драйвер для SM6375
 
-## Статус: ✅ Базовая инфраструктура готова
+## Статус: ⚠️ Драйвер переписан, на железе не проверен
+
+Основной режим — **takeover**: если загрузчик уже поднял UFS (HCE=1, HCS.DP=1), ядро не трогает PHY и линк, а ставит свои списки запросов, делает NOP OUT / fDeviceInit (при необходимости), TEST UNIT READY и READ CAPACITY. Полный init (HCE + PHY + link startup) оставлен как запасной путь (`FORCE_FULL_INIT`), PHY-последовательность в нём не проверена.
+
+Размер блока берётся из READ CAPACITY (на UFS обычно 4096 байт); `ufs_read_sectors` и GPT работают в логических блоках устройства.
 
 ### Компоненты
 
@@ -47,7 +51,9 @@ LOAD_BASE=0x... make build   # должен быть кратен 2 MiB и ра�
 | **UFS PHY init** | ✅ | Настройка QMP v4 PHY @ 0x4807000 |
 | **Link startup** | ✅ | DME_LINKSTARTUP, ожидание ULSS |
 | **Block device API** | ✅ | `ufs_read_sectors(lba, count, buf)` |
-| **SCSI READ(10)** | ⏳ | Базовая реализация (не тестирована) |
+| **SCSI READ(10)** | ⏳ | Реализовано (UTRD/UPIU по UFSHCI 3.0), не тестировано на железе |
+| **READ CAPACITY(10)** | ✅ | Ёмкость и размер блока при probe |
+| **GPT** | ✅ | Поиск ESP, учитывает размер блока |
 | **Интеграция initramfs** | ⏳ | Загрузка cpio с UFS вместо RAM |
 
 ---
@@ -154,8 +160,8 @@ ufsphy_mem@4807000 {
 ## Следующие шаги
 
 1. **Тест на железе**: проверить `ufs: probe ok` и `link startup complete`
-2. **READ CAPACITY**: реализовать SCSI READ CAPACITY(10) для `ufs_get_capacity()`
-3. **Partition table**: добавить парсинг GPT для поиска initramfs partition
+2. ~~READ CAPACITY~~ — сделано
+3. ~~GPT~~ — сделано (поиск ESP); нужен поиск произвольного раздела
 4. **On-demand loading**: загружать файлы из cpio по мере обращения (не весь initramfs в RAM)
 5. **Write support**: SCSI WRITE(10) для persistence (логи, конфиги)
 

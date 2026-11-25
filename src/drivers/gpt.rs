@@ -10,7 +10,7 @@
 //!
 //! EFI System Partition type GUID: C12A7328-F81F-11D2-BA4B-00A0C93EC93B
 
-use crate::drivers::ufs::{ufs_read_sectors, ufs_get_capacity};
+use crate::drivers::ufs::{ufs_block_size, ufs_read_sectors};
 use crate::sync::SpinLock;
 use core::sync::atomic::{AtomicBool, Ordering};
 
@@ -92,12 +92,13 @@ impl GptPartition {
     
     /// Размер в байтах
     pub fn size_bytes(&self) -> u64 {
-        self.size_sectors() * 512
+        self.size_sectors() * (ufs_block_size().max(512) as u64)
     }
 }
 
 /// Статический буфер для чтения GPT (1 сектор = 512 байт)
-static GPT_BUF: SpinLock<[u8; 512]> = SpinLock::new([0u8; 512]);
+// Буфер на один логический блок UFS (обычно 4096 байт, на старых устройствах 512).
+static GPT_BUF: SpinLock<[u8; 4096]> = SpinLock::new([0u8; 4096]);
 static GPT_PARSED: AtomicBool = AtomicBool::new(false);
 static GPT_ESP: SpinLock<Option<GptPartition>> = SpinLock::new(None);
 
@@ -201,6 +202,9 @@ pub fn gpt_find_esp() -> Result<GptPartition, &'static str> {
         // Не возвращаем ошибку — некоторые загрузчики не обновляют CRC
     }
     
+    // Отпускаем GPT_BUF: gpt_read_sector() ниже берёт его снова, иначе взаимная блокировка.
+    drop(buf);
+
     // Используем распарсенные значения
     let entry_lba = part_entry_start_lba;
     let num_entries = num_part_entries as usize;
@@ -211,7 +215,12 @@ pub fn gpt_find_esp() -> Result<GptPartition, &'static str> {
     }
     
     // Читаем массив записей разделов
-    let entries_per_sector = 512 / entry_size; // 4 entries per sector
+    // LBA в GPT — в логических блоках устройства (на UFS обычно 4 КиБ).
+    let block = ufs_block_size();
+    if block < entry_size || block > 4096 {
+        return Err("Unsupported UFS block size");
+    }
+    let entries_per_sector = block / entry_size;
     let total_sectors = (num_entries + entries_per_sector - 1) / entries_per_sector;
     
     let mut found_esp = None;
