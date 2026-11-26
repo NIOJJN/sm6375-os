@@ -1,5 +1,5 @@
 # vv1raos
-
+**English** | [Русский](README.ru.md)
 A standalone, bare-metal kernel for AArch64, written in Rust.
 
 vv1raos does not depend on Android or Linux. It is a `#![no_std]`, `#![no_main]` kernel with no external crate dependencies. It builds with stable Rust and runs under QEMU (`virt` machine), and it is being brought up on real hardware: the Qualcomm SM6375 (Snapdragon 695, "Blair") in the Poco X4 Pro.
