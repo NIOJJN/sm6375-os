@@ -233,7 +233,7 @@ All UFSHCI structures (UTRD, UPIU, PRDT) were written against UFSHCI 3.0 and Lin
 | Component                     | Status | Notes                                                                           |
 | ----------------------------- | ------ | ------------------------------------------------------------------------------- |
 | Takeover path                 | ⏳     | Implemented; untested on hardware                                               |
-| UFS PHY init (QMP v4)         | ❌     | Minimal sequence, **unverified**; real tables needed                            |
+| UFS PHY init (QMP v4)         | ⏳     | Tables from Linux `phy-qcom-qmp-ufs` (SM8150); untested on hardware             |
 | Link startup                  | ⏳     | `DME_LINKSTARTUP` with retries; untested                                        |
 | Device init                   | ⏳     | `NOP OUT` + `fDeviceInit` query flag; untested                                  |
 | SCSI `READ(10)`               | ⏳     | Implemented; untested on hardware                                               |
@@ -241,7 +241,7 @@ All UFSHCI structures (UTRD, UPIU, PRDT) were written against UFSHCI 3.0 and Lin
 | Block device API              | ✅     | `ufs_read_sectors`, `ufs_get_capacity`, `ufs_block_size`                        |
 | GPT (ESP lookup)              | ⏳     | Runs after a successful probe; see [GPT](#gpt)                                  |
 | initramfs from UFS            | ⏳     | Planned: load cpio from UFS instead of RAM                                      |
-| SCSI `WRITE(10)`              | ❌     | Not implemented                                                                 |
+| SCSI `WRITE(10)`              | ⏳     | Implemented (`ufs_write_sectors`); untested on hardware                         |
 
 ### Design notes and limits
 
@@ -379,11 +379,11 @@ If the kernel faults, `exception_handler` prints the exception vector, `ESR`, `E
 ### Roadmap
 
 - [ ] Verify probe and takeover path on hardware
-- [ ] Replace the unverified PHY sequence with the real QMP v4 tables from Linux
+- [x] Replace the unverified PHY sequence with the real QMP v4 tables from Linux (`src/drivers/ufs_phy_qmp_v4.rs`)
 - [ ] GPT: look up arbitrary partitions, not only the ESP
 - [ ] On-demand file loading from cpio (avoid loading the whole initramfs into RAM)
-- [ ] SCSI `WRITE(10)` for persistence (logs, configuration)
-- [ ] UART receive on the GENI console
+- [x] SCSI `WRITE(10)` for persistence (logs, configuration) (`ufs_write_sectors`)
+- [x] UART receive on the GENI console (`geni_uart::getc()`)
 - [ ] Use all 8 SM6375 cores (`MAX_CPUS` is 4)
 - [ ] Compressed (deflate) gzip support for the initramfs
 - [x] READ CAPACITY

@@ -232,7 +232,7 @@ ELF ядра — `target/aarch64-unknown-none-softfloat/release/mk` (крейт 
 | Компонент | Статус | Примечания |
 |---|---|---|
 | Путь takeover | ⏳ | Реализован; не тестировался на железе |
-| Инициализация UFS PHY (QMP v4) | ❌ | Минимальная последовательность, **непроверена**; нужны реальные таблицы |
+| Инициализация UFS PHY (QMP v4) | ⏳ | Таблицы из Linux `phy-qcom-qmp-ufs` (SM8150); не тестировались на железе |
 | Link startup | ⏳ | `DME_LINKSTARTUP` с повторами; не тестировался |
 | Инициализация устройства | ⏳ | `NOP OUT` + query-флаг `fDeviceInit`; не тестировалось |
 | SCSI `READ(10)` | ⏳ | Реализован; не тестировался на железе |
@@ -240,7 +240,7 @@ ELF ядра — `target/aarch64-unknown-none-softfloat/release/mk` (крейт 
 | API блочного устройства | ✅ | `ufs_read_sectors`, `ufs_get_capacity`, `ufs_block_size` |
 | GPT (поиск ESP) | ⏳ | Запускается после успешного probe; см. GPT |
 | initramfs из UFS | ⏳ | Планируется: загружать cpio из UFS вместо RAM |
-| SCSI `WRITE(10)` | ❌ | Не реализован |
+| SCSI `WRITE(10)` | ⏳ | Реализован (`ufs_write_sectors`); не тестировался на железе |
 
 ### Замечания по дизайну и ограничения
 
@@ -378,11 +378,11 @@ kprintln!("UFS: starting probe...");
 ### Дорожная карта
 
 - Проверить probe и путь takeover на железе.
-- Заменить непроверенную последовательность PHY на реальные таблицы QMP v4 из Linux.
+- ✅ Заменить непроверенную последовательность PHY на реальные таблицы QMP v4 из Linux (сделано: `src/drivers/ufs_phy_qmp_v4.rs`).
 - GPT: искать произвольные разделы, а не только ESP.
 - Загрузка файлов из cpio по требованию (не грузить весь initramfs в RAM).
-- SCSI `WRITE(10)` для персистентности (логи, конфигурация).
-- Приём данных на GENI консоли.
+- ✅ Реализовать SCSI `WRITE(10)` (`ufs_write_sectors` в `src/drivers/ufs.rs`).
+- ✅ Приём данных на GENI консоли (`geni_uart::getc()`).
 - Использовать все 8 ядер SM6375 (`MAX_CPUS` равен 4).
 - Поддержка сжатого (deflate) gzip для initramfs.
 - READ CAPACITY.
