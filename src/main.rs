@@ -222,14 +222,16 @@ pub extern "C" fn kernel_main(dtb: usize) -> ! {
     shm::init();
     port::init();
     ipc::init();
-    initramfs::init(&info);
-    crate::drivers::vibro::indicate(crate::drivers::vibro::BootStage::InitramfsOk);
 
     // ---- Platform device model (Qualcomm SM6375) ----
     // Парсинг DT и регистрация platform устройств
     platform::platform_init(info.dtb);
     // Пробирование драйверов: GCC -> SPMI -> PMIC -> UART -> UFS
     platform::platform_drivers_init();
+
+    // Теперь UFS готов — загружаем initramfs (сначала UFS ESP, потом DTB fallback)
+    initramfs::init(&info);
+    crate::drivers::vibro::indicate(crate::drivers::vibro::BootStage::InitramfsOk);
 
     // Инициализация pinmux (TLMM) для UART пинов, если загрузчик не настроил
     if let Some(tlmm_base) = info.pinctrl {
