@@ -1,0 +1,1 @@
+/mnt/d/vv1raos-main/user/target/aarch64-unknown-none-softfloat/release/user: /mnt/d/vv1raos-main/user/build.rs /mnt/d/vv1raos-main/user/link.ld /mnt/d/vv1raos-main/user/src/init.rs /mnt/d/vv1raos-main/user/src/main.rs /mnt/d/vv1raos-main/user/src/mem.rs /mnt/d/vv1raos-main/user/src/selftest.rs /mnt/d/vv1raos-main/user/src/shell.rs /mnt/d/vv1raos-main/user/src/sys.rs
