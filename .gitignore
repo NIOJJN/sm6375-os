@@ -1,4 +1,5 @@
 /target
+user/target
 *.img
 *.py
 !gen_fake_dtb.py
