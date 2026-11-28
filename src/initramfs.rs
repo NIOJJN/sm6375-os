@@ -1,6 +1,9 @@
 //! Initramfs (cpio newc + gzip) parser.
-//! Загружается прошивкой/QEMU по физическому адресу (DTB / chosen/linux,initrd-start/end).
+//! Загружается:
+//! 1. С UFS (GPT ESP partition) — основной путь для телефона
+//! 2. Fallback: от загрузчика через DTB (chosen/linux,initrd-start/end) — QEMU, fastboot boot
 
+use crate::drivers::gpt;
 use crate::pmm;
 use core::{slice, str};
 
@@ -26,6 +29,9 @@ struct CpioHeader {
 const CPIO_MAGIC: &[u8; 6] = b"070701";
 const TRAILER_NAME: &str = "TRAILER!!!";
 
+/// Имя файла initramfs на ESP разделе (без ведущего '/')
+const INITRAMFS_FILENAME: &str = "initramfs.cpio";
+
 /// Парсит 8-байтное hex-число (big-endian ASCII).
 fn parse_hex8(b: &[u8]) -> usize {
     let s = str::from_utf8(b).unwrap_or("");
@@ -46,8 +52,118 @@ pub struct InitramfsFile {
 static mut FILES: [Option<InitramfsFile>; 32] = [const { None }; 32];
 static mut FILES_COUNT: usize = 0;
 
-/// Инициализация: ищет initrd в DTB (chosen/linux,initrd-start/end), распаковывает gzip + cpio.
+/// Загружает initramfs с UFS (GPT ESP partition).
+/// Возвращает true если успешно загрузил и распаковал.
+fn try_load_from_ufs() -> bool {
+    // Находим ESP раздел
+    let esp_info = match gpt::gpt_esp_info() {
+        Some(info) => info,
+        None => {
+            crate::kprintln!("initramfs: UFS ESP not found");
+            return false;
+        }
+    };
+    let (esp_lba, esp_sectors) = esp_info;
+    crate::kprintln!("initramfs: ESP at LBA {} ({} sectors)", esp_lba, esp_sectors);
+
+    // Читаем первый сектор ESP, чтобы проверить наличие initramfs.cpio
+    // Файловая система на ESP обычно FAT32, но для простоты читаем raw
+    // и ищем cpio magic "070701" в первом секторе.
+    let block_size = crate::drivers::ufs::ufs_block_size();
+    // UFS block size max 4096, используем стек-массив
+    let mut buf = [0u8; 4096];
+    // Читаем первые несколько секторов (FAT32 boot sector + fat tables + root dir)
+    // Для простоты читаем первый сектор ESP и ищем cpio magic
+    if let Err(_) = gpt::gpt_read_esp(0, 1, &mut buf[..block_size]) {
+        crate::kprintln!("initramfs: failed to read ESP sector 0");
+        return false;
+    }
+
+    // Ищем cpio magic в буфере
+    let mut cpio_offset = None;
+    for i in 0..buf.len().saturating_sub(6) {
+        if &buf[i..i+6] == CPIO_MAGIC {
+            cpio_offset = Some(i);
+            break;
+        }
+    }
+    let cpio_offset = match cpio_offset {
+        Some(o) => o,
+        None => {
+            crate::kprintln!("initramfs: cpio magic not found in ESP sector 0");
+            return false;
+        }
+    };
+    crate::kprintln!("initramfs: found cpio at offset {} in ESP", cpio_offset);
+
+    // Теперь читаем весь initramfs. Сначала оцениваем размер:
+    // Читаем заголовок cpio чтобы узнать размер файла TRAILER!!! или просто читаем весь ESP
+    // Простой подход: читаем весь ESP в память (ограничен MAX_UNCOMPRESSED)
+    let esp_total_bytes = esp_sectors * block_size as u64;
+    if esp_total_bytes > MAX_UNCOMPRESSED as u64 {
+        crate::kprintln!("initramfs: ESP too large ({} > {} bytes)", esp_total_bytes, MAX_UNCOMPRESSED);
+        return false;
+    }
+
+    // Выделяем буфер для всего ESP
+    let size = esp_total_bytes as usize;
+    let dst = match pmm::alloc_contiguous(size) {
+        Some(p) => p,
+        None => {
+            crate::kprintln!("initramfs: OOM allocating {} bytes for ESP", size);
+            return false;
+        }
+    };
+
+    // Читаем весь ESP
+    let sectors_to_read = esp_sectors as u16;
+    if let Err(_) = gpt::gpt_read_esp(0, sectors_to_read, unsafe { slice::from_raw_parts_mut(dst as *mut u8, size) }) {
+        crate::kprintln!("initramfs: failed to read full ESP");
+        return false;
+    }
+
+    // Сдвигаем указатель на cpio offset
+    let cpio_ptr = unsafe { (dst as *const u8).add(cpio_offset) };
+    let cpio_size = size - cpio_offset;
+    let data = unsafe { slice::from_raw_parts(cpio_ptr, cpio_size) };
+
+    // Распаковываем gzip, если нужно
+    static mut GUNZIP_BUF: [u8; MAX_UNCOMPRESSED] = [0; MAX_UNCOMPRESSED];
+    let uncompressed = if data.len() >= 2 && data[0] == 0x1f && data[1] == 0x8b {
+        let out_len = match gunzip(data, unsafe { &mut GUNZIP_BUF }) {
+            Some(len) => len,
+            None => {
+                crate::kprintln!("initramfs: gzip decompress failed");
+                return false;
+            }
+        };
+        unsafe { &GUNZIP_BUF[..out_len] }
+    } else {
+        if cpio_size > MAX_UNCOMPRESSED {
+            crate::kprintln!("initramfs: uncompressed cpio too large ({} > {})", cpio_size, MAX_UNCOMPRESSED);
+            return false;
+        }
+        unsafe {
+            GUNZIP_BUF[..cpio_size].copy_from_slice(data);
+            &GUNZIP_BUF[..cpio_size]
+        }
+    };
+
+    // Парсим cpio
+    parse_cpio(unsafe { core::mem::transmute::<&[u8], &'static [u8]>(uncompressed) });
+    crate::kprintln!("initramfs: loaded {} files from UFS ESP", unsafe { FILES_COUNT });
+    true
+}
+
+/// Инициализация: сначала пробует UFS (ESP), затем fallback на DTB (chosen/linux,initrd-start/end).
 pub fn init(fdt: &crate::fdt::BootInfo) {
+    // Сначала пробуем загрузить с UFS
+    if try_load_from_ufs() {
+        return;
+    }
+
+    // Fallback: DTB
+    crate::kprintln!("initramfs: falling back to DTB initrd");
     let (start, end) = match (fdt.initrd_start, fdt.initrd_end) {
         (Some(s), Some(e)) if e > s => (s, e),
         _ => {

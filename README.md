@@ -381,11 +381,12 @@ If the kernel faults, `exception_handler` prints the exception vector, `ESR`, `E
 - [ ] Verify probe and takeover path on hardware
 - [x] Replace the unverified PHY sequence with the real QMP v4 tables from Linux (`src/drivers/ufs_phy_qmp_v4.rs`)
 - [ ] GPT: look up arbitrary partitions, not only the ESP
+- [x] Initramfs from UFS (ESP partition) — primary path, DTB fallback (`src/initramfs.rs`)
 - [ ] On-demand file loading from cpio (avoid loading the whole initramfs into RAM)
 - [x] SCSI `WRITE(10)` for persistence (logs, configuration) (`ufs_write_sectors`)
 - [x] UART receive on the GENI console (`geni_uart::getc()`)
 - [ ] Use all 8 SM6375 cores (`MAX_CPUS` is 4)
-- [ ] Compressed (deflate) gzip support for the initramfs
+- [ ] Compressed (deflate) gzip support for the initramfs (partial: stored blocks only)
 - [x] READ CAPACITY
 - [x] GPT ESP lookup
 

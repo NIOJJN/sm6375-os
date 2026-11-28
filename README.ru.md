@@ -380,11 +380,12 @@ kprintln!("UFS: starting probe...");
 - Проверить probe и путь takeover на железе.
 - ✅ Заменить непроверенную последовательность PHY на реальные таблицы QMP v4 из Linux (сделано: `src/drivers/ufs_phy_qmp_v4.rs`).
 - GPT: искать произвольные разделы, а не только ESP.
+- ✅ Initramfs с UFS (ESP раздел) — основной путь, fallback на DTB (`src/initramfs.rs`).
 - Загрузка файлов из cpio по требованию (не грузить весь initramfs в RAM).
 - ✅ Реализовать SCSI `WRITE(10)` (`ufs_write_sectors` в `src/drivers/ufs.rs`).
 - ✅ Приём данных на GENI консоли (`geni_uart::getc()`).
 - Использовать все 8 ядер SM6375 (`MAX_CPUS` равен 4).
-- Поддержка сжатого (deflate) gzip для initramfs.
+- Поддержка сжатого (deflate) gzip для initramfs (частично: только stored blocks).
 - READ CAPACITY.
 - Поиск GPT ESP.
 
