@@ -1,2 +1,0 @@
-cargo:rustc-link-arg=-T/mnt/d/vv1raos-main/user/link.ld
-cargo:rerun-if-changed=link.ld
